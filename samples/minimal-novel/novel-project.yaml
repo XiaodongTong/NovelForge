@@ -13,32 +13,55 @@ novel:
 pipeline:
   stages:
     # --------------------------------------------------------------- #
-    # Stage 1: generate a short outline from the seeds.
+    # Stage 1: generate a short outline from the seeds.  PR-2 moved
+    # the output path from output/summaries/plot.md to the dedicated
+    # chapters-outline/ directory.
     # --------------------------------------------------------------- #
     - id: generate_outline
       model: claude-opus-4-7
       prompt: prompts/generate-outline.md
       produces:
-        - path: output/summaries/plot.md
+        - path: chapters-outline/outline.md
           alias: outline
       done_when:
         max_attempts: 3
         checks:
           - kind: min_chars
-            target: output/summaries/plot.md
+            target: chapters-outline/outline.md
             value: 200
           - kind: regex_match
-            target: output/summaries/plot.md
+            target: chapters-outline/outline.md
             pattern: "## Chapter"
 
     # --------------------------------------------------------------- #
-    # Stage 2: write a single chapter that consumes the outline.
-    # Demonstrates {{upstream.*}} placeholders + consumes: explicit list.
+    # Stage 2: design character dossiers (PR-2 split-mode).  One
+    # markdown file per character; slug is captured from the model's
+    # ``# <name>`` heading and must satisfy [A-Za-z0-9_-]+.
+    # --------------------------------------------------------------- #
+    - id: design_characters
+      model: claude-opus-4-7
+      prompt: prompts/design-characters.md
+      consumes: [generate_outline]
+      produces:
+        - path: characters/{{slug}}.md
+          alias: characters
+          split: "^#\\s+(?P<slug>[A-Za-z0-9_-]+)\\s*$"
+      done_when:
+        max_attempts: 3
+        checks:
+          - kind: min_chars
+            target: characters/{{slug}}.md
+            value: 200
+
+    # --------------------------------------------------------------- #
+    # Stage 3: write a single chapter that consumes the outline +
+    # the split-mode character dossiers via the [*] list reference.
+    # Demonstrates consumes: explicit list.
     # --------------------------------------------------------------- #
     - id: write_chapter
       model: claude-opus-4-7
       prompt: prompts/write-chapter.md
-      consumes: [generate_outline]
+      consumes: [generate_outline, design_characters]
       produces:
         - path: output/chapters/001.md
           alias: chapter
@@ -50,7 +73,7 @@ pipeline:
             value: 400
 
     # --------------------------------------------------------------- #
-    # Stage 3: review the chapter.  Demonstrates consumes: [] (no
+    # Stage 4: review the chapter.  Demonstrates consumes: [] (no
     # upstream bindings) + a json_field check.
     # --------------------------------------------------------------- #
     - id: review_chapter

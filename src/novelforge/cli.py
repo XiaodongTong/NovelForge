@@ -17,6 +17,10 @@ v4 notes:
   by hand or re-run ``init`` (spec §AC-15).
 - The v3 fields ``pipeline.template`` / ``pipeline.stages_override`` /
   ``pipeline.scaffold_from`` are rejected at load time.
+- v4.1 (PR-1): ``init`` now scaffolds user seed files
+  (``outline/premise.md`` + ``outline/world.md`` + ``CLAUDE.md``)
+  and the runtime directories with ``.gitkeep`` markers.  Use
+  ``--skeleton-only`` to opt out of the user seeds.
 """
 
 from __future__ import annotations
@@ -327,6 +331,73 @@ constraints:
 """
 
 
+# Runtime directories that ``init`` always materialises (with a
+# ``.gitkeep`` so they survive an empty-tree commit).  The directory
+# tree is documented in ``templates.CLAUDE_TEMPLATE``; keeping both
+# lists here in lock-step is the spec §AC-1 contract.
+RUNTIME_DIRS: tuple[str, ...] = (
+    "characters",
+    "chapters-outline",
+    "output/summaries",
+    "output/meta",
+    "output/chapters",
+    "output/review",
+)
+
+
+# User-facing seed file templates.  Short and in Chinese to match the
+# target audience (spec §6 OQ-1).  Both include visible section
+# headings so ``_check_seed_files`` (which only checks for existence)
+# sees them as "non-empty" without committing to content validation.
+PREMISE_TEMPLATE = """\
+# Premise
+
+## 故事前提（核心冲突）
+
+用 1-2 句话回答：**主角要在哪个不可调和的矛盾里行动**。
+
+## 主角北极星
+
+主角在故事结尾想达成（或被迫接受）的状态是什么？不要写愿望，要写**代价**。
+
+## 世界底线
+
+这个故事的"物理 / 道德底线"是什么？什么**绝对不能**发生？（例：死人不会复活 / 主角不会主动杀人）
+
+## 调性与篇幅
+
+- 调性：例如 melancholic post-apocalypse / 热血群像 / 慢热悬疑
+- 篇幅：target_chapters × words_per_chapter 的预估总字数
+
+> 删掉这些占位行，开始写你的故事前提。
+"""
+
+
+WORLD_TEMPLATE = """\
+# World
+
+## 势力 / 阵营
+
+列出主要阵营，每个一行：
+
+- <阵营名>：一句话定位 + 与主角的初始关系
+
+## 时代 / 技术基线
+
+一句话交代故事发生的时间坐标（古代 / 近代 / 未来）+ 可用 / 不可用的技术。
+
+## 地理边界
+
+故事**会**发生的区域（不要列"世界地图"，要列**会**被用到的三五个关键地点）。
+
+## 调性关键词
+
+5 个以内，每个一行；这些词会被引擎用作风格锚点。
+
+> 删掉这些占位行，开始写你的世界设定。
+"""
+
+
 def _render_template_yaml(
     *,
     template_name: str,
@@ -365,6 +436,56 @@ def _render_template_yaml(
     return payload, prompts
 
 
+# --------------------------------------------------------------------------- #
+# init helpers
+# --------------------------------------------------------------------------- #
+
+
+def _write_seed(path: Path, body: str, *, force: bool) -> bool:
+    """Write a seed file to ``path``; skip if it already exists.
+
+    Returns ``True`` when the file was actually written (either
+    because it didn't exist or because ``force`` was set).  Returns
+    ``False`` when the file already existed and ``force`` was False
+    (i.e. the user's content was preserved, spec §AC-5).
+    """
+
+    if path.exists() and not force:
+        return False
+    if path.exists() and force:
+        _maybe_warn_overwrite(path)
+    _ensure_dir(path.parent)
+    _atomic_write(path, body)
+    return True
+
+
+def _ensure_gitkeep(dir_path: Path, *, force: bool) -> bool:
+    """Make sure ``dir_path`` exists and has a ``.gitkeep`` marker.
+
+    ``dir_path`` is interpreted relative to the user's project root.
+    Returns ``True`` when something was actually written or the
+    directory was newly created.
+    """
+
+    created = False
+    if not dir_path.exists():
+        _ensure_dir(dir_path)
+        created = True
+    keep = dir_path / ".gitkeep"
+    if keep.exists() and not force:
+        return created
+    if keep.exists() and force:
+        _maybe_warn_overwrite(keep)
+    _atomic_write(keep, "")
+    return True
+
+
+def _maybe_warn_overwrite(path: Path) -> None:
+    """Print a console warning when ``init --force`` overwrites a file."""
+
+    err_console.print(f"[yellow]WARN:[/yellow] overwriting {path}")
+
+
 @app.command()
 def init(
     template: str = typer.Option(
@@ -384,11 +505,30 @@ def init(
         "--force",
         help="Overwrite existing files.",
     ),
+    skeleton_only: bool = typer.Option(
+        False,
+        "--skeleton-only",
+        help=(
+            "Skip writing user seed files (outline/, CLAUDE.md); only "
+            "materialise yaml + prompts/ + empty runtime dirs.  Useful "
+            "for CI / re-templating an existing project."
+        ),
+    ),
 ) -> None:
-    """Scaffold a fresh v4 project (yaml + prompts/).
+    """Scaffold a fresh v4 project (yaml + prompts + seeds + dirs).
 
-    Per spec §5.5: this command does **not** generate ``outline/`` or
-    other user-seed files; the user supplies them.
+    The default run writes:
+
+    - ``novel-project.yaml`` + every ``prompts/*.md`` (template-driven)
+    - ``outline/premise.md`` + ``outline/world.md`` + ``CLAUDE.md``
+      (user-facing seeds with sectioned placeholders, spec §AC-3)
+    - Six runtime directories with ``.gitkeep`` markers
+      (spec §AC-1)
+
+    With ``--skeleton-only`` the user seeds are **not** written; only
+    the engine-side scaffold remains (yaml + prompts + empty dirs).
+    Combine with ``--force`` to refresh an existing scaffold without
+    touching user content (spec §AC-15).
     """
 
     project_dir = project_dir.expanduser().resolve()
@@ -408,19 +548,55 @@ def init(
             f"[red]Refusing to overwrite:[/red] {yaml_path} (use --force to override)"
         )
         raise typer.Exit(code=2)
+    if yaml_path.exists() and force:
+        _maybe_warn_overwrite(yaml_path)
     _atomic_write(yaml_path, _yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
     _ensure_dir(prompts_dir)
     for fname, body in prompts.items():
         target = prompts_dir / fname
         if target.exists() and not force:
             continue
+        if target.exists() and force:
+            _maybe_warn_overwrite(target)
         _atomic_write(target, body)
+
+    # --- 1. User seed files (skipped under --skeleton-only) ----------
+    seeds_written = 0
+    if not skeleton_only:
+        seeds: tuple[tuple[Path, str], ...] = (
+            (project_dir / "outline" / "premise.md", PREMISE_TEMPLATE),
+            (project_dir / "outline" / "world.md", WORLD_TEMPLATE),
+            (project_dir / "CLAUDE.md", _templates.CLAUDE_TEMPLATE),
+        )
+        for target, body in seeds:
+            if _write_seed(target, body, force=force):
+                seeds_written += 1
+
+    # --- 2. Runtime directories with .gitkeep -------------------------
+    for rel in RUNTIME_DIRS:
+        _ensure_gitkeep(project_dir / rel, force=force)
+
+    # --- 3. Next-steps hint ------------------------------------------
+    if skeleton_only:
+        next_hint = (
+            "no user seeds written (--skeleton-only).  "
+            "Add outline/premise.md, outline/world.md, CLAUDE.md yourself "
+            "before running `novelforge run`."
+        )
+    else:
+        next_hint = (
+            "Next: edit `outline/premise.md` + `outline/world.md`, "
+            "see `CLAUDE.md` for the writing rules.  "
+            "Then `novelforge validate --config novel-project.yaml` "
+            "and `novelforge run --use-mock`."
+        )
+
     console.print(
         f"[green]Scaffolded:[/green] {yaml_path} + {len(prompts)} prompt file(s)"
+        f" + {seeds_written} seed file(s)"
+        f" + {len(RUNTIME_DIRS)} runtime dir(s)"
     )
-    console.print(
-        "  Next: prepare outline/ + CLAUDE.md, then `novelforge run`."
-    )
+    console.print(f"  {next_hint}")
 
 
 if __name__ == "__main__":  # pragma: no cover

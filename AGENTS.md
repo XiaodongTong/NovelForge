@@ -20,6 +20,7 @@ novelforge/
 │   ├── errors.py                # Four-tier exception hierarchy
 │   ├── artifact_registry.py     # Runtime {stage_id: {alias: Path | list[Path]}} store
 │   ├── verify.py                # CheckSpec / DoneWhenSpec + 6 check kinds
+│   ├── templates.py             # Built-in ContractTemplate + init seed templates (CLAUDE_TEMPLATE)
 │   ├── stages/                  # GenericStage (single executor for every step)
 │   ├── claude/                  # Adapter, context manager, output parser, token logging
 │   └── utils/                   # Filesystem helpers, logging config

@@ -552,15 +552,75 @@ class MockClaudeAdapter:
             return (
                 '{"passed": true, "findings": [], "summary": "ok"}'
             )
+        if stage.startswith("write") or stage == "write_chapter":
+            # Long-epic template's chapter min_chars is 1000; emit
+            # ≥1000 chars per chapter so a default mock run can pass
+            # without per-test canned responses.
+            paragraph = (
+                "故事在第三个夜晚断裂。那一夜守城的老人没有按时换岗，"
+                "城外的火把却比往常更早亮起来；当第一支箭钉入旗杆，"
+                "整个北城的孩子都被同一句话惊醒：「把它当作最后一夜」。"
+                "主人公平生第一次意识到，所谓命运并不是一条直线，"
+                "而是一团被风吹散的灰烬——灰烬在夜里看不见方向，"
+                "但落到肩上时，每一粒都有自己的温度。他没有哭，"
+                "因为他知道哭会让身边的人更害怕；他没有笑，"
+                "因为他知道笑在这种夜里会让所有人都记恨他一辈子。"
+                "他把弓箭拾起来，把外衣撕下一条绑住流血的指节，"
+                "朝着城门外的方向走——没有人拦他，也没有人敢问他要去哪里。"
+            )
+            return (
+                f"# Chapter {{num}} - Untitled\n\n"
+                + (paragraph + "\n\n") * 4
+            )
         if stage.startswith("generate") or stage.endswith("outline"):
-            # Include a "## Chapter N - Title" heading so the default
-            # sample's regex_match check on outlines passes in mock mode.
+            # Include multiple "## Chapter N - Title" headings so the
+            # default sample's regex_match check on outlines passes in
+            # mock mode AND the long-epic template's ``min_chars: 500``
+            # done_when check passes without custom mock bodies.
             return (
                 f"# Outline for {stage}\n\n"
                 "## Chapter 1 - The Hero Awakens\n"
                 "A young hero discovers a hidden power and must rise to "
                 "meet an ancient threat. The world is broken; the seeds "
-                "of restoration lie scattered, waiting to be found."
+                "of restoration lie scattered, waiting to be found.\n\n"
+                "## Chapter 2 - The First Pact\n"
+                "An offer arrives from a stranger whose smile hides old "
+                "blood debts. The hero trades a memory for a name; the "
+                "name becomes a weapon, the weapon becomes a curse.\n\n"
+                "## Chapter 3 - The Hollow Crown\n"
+                "A council of elders fractures along fault lines the hero "
+                "did not know existed. Each faction believes it owns the "
+                "future; each is owned, in turn, by what it refuses to "
+                "remember.\n\n"
+                "## Chapter 4 - The Long Night\n"
+                "The siege begins. Children sing forbidden verses in "
+                "cellars; the verses become the only light that keeps the "
+                "dark at bay. By dawn three of the singers are gone."
+            )
+        if stage == "design_characters":
+            # Split-mode stage (PR-2).  Emit 3 ASCII-safe character
+            # headings so the split regex (`^#\s+(?P<slug>[A-Za-z0-9_-]+)`)
+            # produces ≥ 3 files.  Slug charset is locked to
+            # ``[A-Za-z0-9_-]+`` per plan TD-7 — using only ASCII here
+            # keeps mock runs representative of well-formed real output.
+            # Each section is padded with prose so the long-epic template's
+            # ``min_chars: 300`` done_when check passes per file.
+            section_template = (
+                "**Role**: 主角/反派/配角\n**Voice**: 一句话描述语言风格\n"
+                "**Relationships**: 与其他角色的关键关系，包括亲情 / 友情 / 敌对\n"
+                "**Arc**: 在故事里的成长或衰落曲线，从初始状态到最终状态的演变路径\n\n"
+                "细节描写：本角色在故事中的关键场景有：开场遭遇、第一次抉择、"
+                "中段冲突、高潮对峙、终局摊牌。每个场景都体现角色的核心矛盾与转变。"
+                "角色台词偏短促有力，避免长篇独白，符合整体文风约束。\n\n"
+                "关键台词样本：「你以为的自由，是另一种笼」「名字是借来的，"
+                "代价是迟早要还」「这盘棋我们都是棋子，包括下棋的人」。"
+                "台词风格刻意压低情绪密度，用短句承担重量，长句只在叙事"
+                "节奏需要留白时才出现。\n\n"
+            )
+            return (
+                "# alice\n\n" + section_template +
+                "# bob\n\n" + section_template +
+                "# carol\n\n" + section_template
             )
         # Generic prose: ≥ 200 chars so default min_chars checks pass.
         return (

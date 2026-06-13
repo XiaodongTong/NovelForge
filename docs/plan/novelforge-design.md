@@ -394,6 +394,22 @@ error_handling:
     max_wait: 300  # 最长等 5 分钟
 ```
 
+### 5.5 `novelforge init` 脚手架增强（v4.1）
+
+v4.1 起 `init` 不再只是"yaml + prompts"两件套，会一并写出**用户种子占位**与**运行时目录占位**：
+
+- 用户种子：`outline/premise.md`、`outline/world.md`、`CLAUDE.md`（body 由 `cli.py` 中的中文常量 + `templates.py::CLAUDE_TEMPLATE` 提供）
+- 运行时目录：`characters/`、`chapters-outline/`、`output/{summaries,meta,chapters,review}/`，每个目录写 `.gitkeep` 占位
+- 新选项 `--skeleton-only`：只生成 yaml + prompts + 运行时目录；跳过种子（用于 CI / 重新模板化的场景）
+- `--force`：覆盖 yaml 时强制；覆盖种子时打 `[yellow]WARN:[/yellow]` 提醒
+
+引擎的输出路径（PR-2 同步迁移）：
+
+- `generate_outline`：`chapters-outline/outline.md`（替代旧的 `output/summaries/plot.md`）
+- `design_characters`：`characters/{{slug}}.md`，split-mode，每个角色一个文件（替代旧的单文件 `output/meta/characters.md`）。slug 字符集硬约束为 `[A-Za-z0-9_-]+`（不可含空格 / 中文 / 标点），不合规的 heading **不会**进入文件名；若全部 heading 都不合规，split 0 匹配会触发 `OutputParseError`（B 档，按 `on_failure` 处置）。
+
+完整方案：`docs/plan/20260614-init-scaffolding.md`。
+
 ## 六、与现有 cybervisor 的演进关系
 
 | 维度 | 现有 cybervisor.yaml | NovelForge |
@@ -426,29 +442,29 @@ error_handling:
 - 多项目并行写作
 - 一键导出 EPUB/PDF
 
-## 八、项目目录结构
+## 八、项目目录结构（v4.1）
 
 ```
 novel-project/
 ├── novel-project.yaml          # 项目声明（引擎读取）
-├── CLAUDE.md                   # 写作规则和禁忌
-├── outline/                    # 故事种子（人工提供）
-│   ├── premise.md
-│   └── world.md
+├── CLAUDE.md                   # 【用户填】写作规则和禁忌（init 会写入模板）
+├── outline/                    # 【用户填】故事种子
+│   ├── premise.md              #   核心冲突 + 主角北极星
+│   └── world.md                #   世界设定：势力 / 时代 / 调性
 ├── prompts/                    # prompt 模板（可自定义覆盖默认）
 │   ├── generate-outline.md
-│   ├── review-outline.md
 │   ├── design-characters.md
-│   ├── review-characters.md
-│   ├── simulate-plot.md
-│   ├── review-simulation.md
 │   ├── write-chapter.md
-│   └── review-chapter.md
+│   ├── review-chapter.md
+│   └── final-polish.md
+├── characters/                 # 【引擎填】每个角色一个 .md（split-mode）
+├── chapters-outline/           # 【引擎填】章节大纲（generate_outline 产物）
+│   └── outline.md
 ├── output/                     # 引擎产出
-│   ├── summaries/              # 大纲、推演、进度
-│   ├── chapters/               # 正文章节
-│   ├── review/                 # 审查报告
-│   └── meta/                   # 角色档案、伏笔追踪
+│   ├── chapters/               #   正文章节（write_chapter 批次）
+│   ├── review/                 #   review JSON + final-polish 报告
+│   ├── summaries/              #   旧版兼容保留位（默认空）
+│   └── meta/                   #   旧版兼容保留位（默认空）
 ├── .novelforge/                # 引擎状态（自动生成）
 │   ├── state.yaml
 │   ├── checkpoints/

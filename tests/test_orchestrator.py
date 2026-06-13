@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import re
 import yaml
 
 from novelforge.config import (
@@ -527,3 +528,207 @@ def test_no_v3_route_strings_in_orchestrator_source() -> None:
     text = src_path.read_text(encoding="utf-8")
     for forbidden in ("NEEDS_REWRITE", "FUNDAMENTAL_ISSUE", "APPROVED"):
         assert forbidden not in text, f"orchestrator.py still mentions {forbidden!r}"
+
+
+# --------------------------------------------------------------------------- #
+# PR-2: split-mode produces + downstream consumption
+# --------------------------------------------------------------------------- #
+
+
+SPLIT_YAML = r"""
+novel:
+  title: T
+  genre: T
+  target_chapters: 1
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
+  constraints: [CLAUDE.md]
+pipeline:
+  stages:
+    - id: design_characters
+      model: m
+      prompt: Emit character dossiers.
+      produces:
+        - path: characters/{{slug}}.md
+          alias: characters
+          split: '^#\s+(?P<slug>[A-Za-z0-9_-]+)\s*$'
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: characters/{{slug}}.md
+            value: 5
+    - id: write_chapter
+      model: m
+      prompt: Write a chapter; use characters {{upstream.design_characters.characters[*]}}.
+      consumes: [design_characters]
+      produces:
+        - path: output/chapter.md
+          alias: chapter
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: output/chapter.md
+            value: 5
+execution:
+  retry:
+    backoff: constant
+    max_wait: 1
+"""
+
+
+def test_design_characters_writes_multiple_files(project_root: Path) -> None:
+    """AC-9: ``design_characters`` (split mode) writes ≥ 2 files into
+    ``characters/`` and each filename satisfies ``[A-Za-z0-9_-]+``."""
+
+    # The default mock body for design_characters emits three ASCII-safe
+    # headings (alice / bob / carol) per the PR-2 mock adapter upgrade.
+    orch, summary = _run(project_root, SPLIT_YAML)
+    assert summary["ok"] is True, summary
+
+    files = sorted((project_root / "characters").glob("*.md"))
+    assert len(files) >= 2, (
+        f"split mode must yield ≥ 2 character files; got {files!r}"
+    )
+    # Every filename must be slug-safe.
+    for f in files:
+        assert re.fullmatch(r"[A-Za-z0-9_-]+\.md", f.name), (
+            f"unsafe character filename: {f.name!r}"
+        )
+
+
+def test_split_mode_registry_stores_list(project_root: Path) -> None:
+    """The ``ArtifactRegistry`` must store the split alias as a
+    ``list[Path]`` (not a single ``Path``) so downstream
+    ``{{upstream.<id>.<alias>[*]}}`` references work."""
+
+    orch, summary = _run(project_root, SPLIT_YAML)
+    assert summary["ok"] is True, summary
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    chars_value = raw["extra"]["artifacts"]["design_characters"]["characters"]
+    assert isinstance(chars_value, list), (
+        f"split alias must be a list; got {chars_value!r}"
+    )
+    assert len(chars_value) >= 2
+
+
+def test_write_chapter_consumes_all_split_characters(project_root: Path) -> None:
+    """AC-11 + spec §5 risk #1: a downstream stage that consumes
+    ``design_characters`` must see every character file in its prompt,
+    not just the first one."""
+
+    from novelforge.claude.adapter import MockClaudeAdapter
+
+    cfg_path = _write_yaml(project_root, SPLIT_YAML)
+    cfg = load_config(cfg_path)
+    orch = Orchestrator(
+        config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
+    )
+    mock = MockClaudeAdapter()
+    # Use an explicit multi-character body to make the assertion robust
+    # even if the default body changes.
+    mock.set_response(
+        "design_characters",
+        __import__("novelforge.claude.adapter", fromlist=["MockResponse"]).MockResponse(
+            output=(
+                "# alice\nlong content for alice with enough words to pass\n"
+                "# bob\nlong content for bob with enough words to pass\n"
+                "# carol\nlong content for carol with enough words to pass\n"
+            )
+        ),
+    )
+    orch._adapter = mock  # type: ignore[attr-defined]
+    summary = orch.run(fresh=True)
+    assert summary["ok"] is True, summary
+
+    # The write_chapter call must have received all three character names.
+    write_chapter_calls = [
+        c for c in mock.calls if c["stage"] == "write_chapter"
+    ]
+    assert write_chapter_calls, "write_chapter was never invoked"
+    prompt = write_chapter_calls[0]["prompt"]
+    for slug in ("alice", "bob", "carol"):
+        assert slug in prompt, (
+            f"downstream prompt missing character {slug!r}; "
+            f"got first 300 chars: {prompt[:300]!r}"
+        )
+
+
+def test_done_when_substitutes_slug_in_split_mode(project_root: Path) -> None:
+    """AC-11 (split-mode done_when): a ``target: characters/{{slug}}.md``
+    check must independently evaluate every split file."""
+
+    from novelforge.verify import (
+        DoneWhenSpec,
+        CheckSpec,
+        run_done_when,
+    )
+
+    # Two character files of differing lengths so the test can prove
+    # per-file substitution works (one passes, one fails).
+    (project_root / "characters").mkdir(parents=True, exist_ok=True)
+    (project_root / "characters" / "alice.md").write_text("A" * 200, encoding="utf-8")
+    (project_root / "characters" / "bob.md").write_text("B" * 5, encoding="utf-8")
+    files = [
+        project_root / "characters" / "alice.md",
+        project_root / "characters" / "bob.md",
+    ]
+    spec = DoneWhenSpec(
+        checks=(
+            CheckSpec(
+                kind="min_chars",
+                target="characters/{{slug}}.md",
+                value=10,
+            ),
+        )
+    )
+    result = run_done_when(
+        spec,
+        files,
+        project_root,
+        placeholders={},
+        per_file_placeholders=[{"slug": "alice"}, {"slug": "bob"}],
+    )
+    assert result.passed is False
+    # alice passes (200 chars ≥ 10); bob fails (5 chars < 10).
+    per_file = {o.target: o.passed for o in result.outcomes}
+    assert per_file["characters/alice.md"] is True
+    assert per_file["characters/bob.md"] is False
+
+
+def test_split_mode_done_when_passes_for_uniform_files(project_root: Path) -> None:
+    """AC-11 corollary: when every split file passes the per-file
+    check, the aggregate passes too."""
+
+    from novelforge.verify import (
+        DoneWhenSpec,
+        CheckSpec,
+        run_done_when,
+    )
+
+    (project_root / "characters").mkdir(parents=True, exist_ok=True)
+    for slug in ("alice", "bob", "carol"):
+        (project_root / "characters" / f"{slug}.md").write_text("C" * 50, encoding="utf-8")
+    files = sorted((project_root / "characters").glob("*.md"))
+    spec = DoneWhenSpec(
+        checks=(
+            CheckSpec(
+                kind="min_chars",
+                target="characters/{{slug}}.md",
+                value=10,
+            ),
+        )
+    )
+    result = run_done_when(
+        spec,
+        files,
+        project_root,
+        placeholders={},
+        per_file_placeholders=[{"slug": f.stem} for f in files],
+    )
+    assert result.passed is True
+    for o in result.outcomes:
+        assert o.passed, f"unexpected failure on {o.target}"

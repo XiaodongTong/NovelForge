@@ -47,7 +47,8 @@ novelforge validate --config <yaml>   # 校验配置文件
 novelforge run --config <yaml>        # 启动端到端流水线
 novelforge resume --config <yaml>     # 从 checkpoint 恢复
 novelforge status --config <yaml>     # 查看当前进度
-novelforge init --template long-epic --dir <path>   # 在空目录生成 v4 yaml + prompts/
+novelforge init --template long-epic --dir <path>   # 在空目录生成 v4 yaml + prompts/ + seeds + 运行时目录
+novelforge init --template long-epic --skeleton-only # 只生成 yaml + prompts/ + 运行时目录（跳过 seeds）
 ```
 
 ### 命令参数
@@ -63,8 +64,61 @@ novelforge init --template long-epic --dir <path>   # 在空目录生成 v4 yaml
 | `status` | `--config <yaml>` | **必填** |
 | `validate` | `--config <yaml>` | **必填** |
 | `init` | `--template <name>` | 模板名（`long-epic` / `short-story`） |
-| | `--dir <path>` | 项目目录（不存在则创建；启用 `--force` 覆盖） |
-| | `--force` | 覆盖现有 yaml / prompts |
+| | `--dir <path>` | 项目目录（不存在则自动创建） |
+| | `--force` | 覆盖现有 yaml / 种子（prompts 总是按 `--force` 决定） |
+| | `--skeleton-only` | 仅生成 yaml + prompts + 运行时目录；跳过 outline/ 与 CLAUDE.md |
+
+## 项目结构
+
+`novelforge init --template <name>` 跑完之后得到一个这样的目录（v4.1+）：
+
+```
+<project_dir>/
+├── novel-project.yaml          # 契约配置（引擎读）
+├── CLAUDE.md                   # 【用户填】写作约束 / 边界说明
+├── outline/                    # 【用户填】故事种子
+│   ├── premise.md              #   核心冲突 + 主角北极星
+│   └── world.md                #   世界设定：势力 / 时代 / 调性
+├── characters/                 # 【引擎填】每个角色一个 .md
+├── chapters-outline/           # 【引擎填】章节大纲
+│   └── outline.md              #   generate_outline 的产物
+├── output/                     # 运行时产物
+│   ├── chapters/               #   最终章节正文（write_chapter）
+│   ├── review/                 #   review JSON + final-polish 报告
+│   ├── summaries/              #   旧版兼容保留位（默认空）
+│   └── meta/                   #   旧版兼容保留位（默认空）
+└── prompts/                    # 每个 stage 的 prompt 模板
+    └── *.md
+```
+
+`outline/` 与 `CLAUDE.md` 是用户要手动填的种子（`--skeleton-only` 模式下 init 会跳过它们，留空目录由用户补）；其它 `characters/` `chapters-outline/` `output/` 目录的 `.gitkeep` 占位由 `init` 自动建好。
+
+## 快速开始：从零到一个可跑项目
+
+```bash
+# 1. 在空目录里初始化项目骨架（v4.1+ 会一并生成 outline/ + CLAUDE.md 占位种子）
+mkdir my-novel && cd my-novel
+novelforge init --template long-epic --dir .
+
+# 2. 填写种子文件（参考 init 时生成的 CLAUDE.md）
+$EDITOR outline/premise.md       # 核心冲突 / 主角北极星
+$EDITOR outline/world.md         # 世界设定
+$EDITOR CLAUDE.md                # 写作约束（init 已写入模板，可按需调整）
+
+# 3. 校验配置
+novelforge validate --config novel-project.yaml
+# 预期输出: Config OK: N chapter(s)
+
+# 4. 运行流水线（mock 模式无需 API key，可先看连通性）
+novelforge run --config novel-project.yaml --use-mock
+# 预期: 依次执行 generate_outline → design_characters → write_chapter
+#        → review_chapter → final_polish
+#        在 characters/、chapters-outline/、output/ 下产出对应文件
+
+# 5. 查看进度 / 中断恢复
+novelforge status  --config novel-project.yaml
+novelforge resume  --config novel-project.yaml --use-mock
+```
 
 ## 快速开始：跑通最小 sample
 
@@ -77,8 +131,9 @@ novelforge validate --config novel-project.yaml
 
 # 2. 运行流水线（mock 模式，无需 API key）
 novelforge run --config novel-project.yaml --use-mock
-# 预期: 依次执行 generate_outline → write_chapter → review_chapter
-#        在 output/ 下产出大纲、章节、审查 JSON
+# 预期: 依次执行 generate_outline → design_characters → write_chapter
+#        → review_chapter
+#        在 chapters-outline/、characters/、output/ 下产出对应文件
 
 # 3. 查看进度
 novelforge status --config novel-project.yaml
@@ -110,7 +165,7 @@ pipeline:
       model: claude-opus-4-7
       prompt: prompts/generate-outline.md
       produces:
-        - path: output/summaries/plot.md
+        - path: chapters-outline/outline.md                 # v4.1+：单文件大纲落到专用目录
           alias: outline
       done_when:
         max_attempts: 3
@@ -118,13 +173,28 @@ pipeline:
         mode: all                                          # all | any
         checks:
           - kind: min_chars
-            target: output/summaries/plot.md
+            target: chapters-outline/outline.md
             value: 500
+
+    - id: design_characters
+      model: claude-opus-4-7
+      prompt: prompts/design-characters.md
+      consumes: [generate_outline]
+      produces:
+        - path: characters/{{slug}}.md                      # v4.1+：split mode，每个角色一个文件
+          alias: characters
+          split: "^#\\s+(?P<slug>[A-Za-z0-9_-]+)\\s*$"
+      done_when:
+        max_attempts: 3
+        checks:
+          - kind: min_chars
+            target: characters/{{slug}}.md                  # 每文件独立校验
+            value: 300
 
     - id: write_chapter
       model: claude-opus-4-7
       prompt: prompts/write-chapter.md
-      consumes: [generate_outline]                          # 显式清单
+      consumes: [generate_outline, design_characters]       # 显式清单
       produces:
         - path: output/chapters/{{num:03d}}.md
           alias: chapter
