@@ -1,0 +1,4 @@
+{"batch": "001", "duration": 0.0, "exit_code": 0, "input_tokens": 50, "model": "mock-model", "output_tokens": 80, "stage": "generate_outline", "timestamp": "2026-06-14T06:44:09+0800"}
+{"batch": "001", "duration": 0.0, "exit_code": 0, "input_tokens": 50, "model": "mock-model", "output_tokens": 80, "stage": "design_characters", "timestamp": "2026-06-14T06:44:09+0800"}
+{"batch": "001", "duration": 0.0, "exit_code": 0, "input_tokens": 50, "model": "mock-model", "output_tokens": 80, "stage": "write_chapter", "timestamp": "2026-06-14T06:44:09+0800"}
+{"batch": "001", "duration": 0.0, "exit_code": 0, "input_tokens": 50, "model": "mock-model", "output_tokens": 80, "stage": "review_chapter", "timestamp": "2026-06-14T06:44:09+0800"}

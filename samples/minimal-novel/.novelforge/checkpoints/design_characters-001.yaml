@@ -1,0 +1,17 @@
+stage: design_characters
+batch: '001'
+files:
+- path: characters/alice.md
+  sha256: cfd4b23e0f7d491f716f929558168e166796c191eb18864e9cc2d1c3aa2394b8
+  size: '800'
+- path: characters/bob.md
+  sha256: cfd4b23e0f7d491f716f929558168e166796c191eb18864e9cc2d1c3aa2394b8
+  size: '800'
+- path: characters/carol.md
+  sha256: cfd4b23e0f7d491f716f929558168e166796c191eb18864e9cc2d1c3aa2394b8
+  size: '800'
+timestamp: '2026-06-14T06:44:09+08:00'
+extras:
+  token_usage:
+    input: 50
+    output: 80

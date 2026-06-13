@@ -1,0 +1,13 @@
+2026-06-14T06:44:09+0800 INFO    novelforge.orchestrator | recovery_plan: next=generate_outline reason=fresh_start paused=False forced=False
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_enter generate_outline
+2026-06-14T06:44:09+0800 INFO    novelforge.stages.generic | stage_prompt stage=generate_outline novel=0 ctx=0 upstream=0 includes=0 warnings=0
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_exit generate_outline route=ok duration=0.004s
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_enter design_characters
+2026-06-14T06:44:09+0800 INFO    novelforge.stages.generic | stage_prompt stage=design_characters novel=0 ctx=0 upstream=0 includes=0 warnings=0
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_exit design_characters route=ok duration=0.004s
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_enter write_chapter
+2026-06-14T06:44:09+0800 INFO    novelforge.stages.generic | stage_prompt stage=write_chapter novel=0 ctx=0 upstream=1 includes=0 warnings=0
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_exit write_chapter route=ok duration=0.004s
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_enter review_chapter
+2026-06-14T06:44:09+0800 INFO    novelforge.stages.generic | stage_prompt stage=review_chapter novel=0 ctx=0 upstream=0 includes=0 warnings=0
+2026-06-14T06:44:09+0800 INFO    novelforge.pipeline | stage_exit review_chapter route=ok duration=0.004s

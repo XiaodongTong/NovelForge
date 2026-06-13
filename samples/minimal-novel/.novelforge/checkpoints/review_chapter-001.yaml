@@ -1,0 +1,11 @@
+stage: review_chapter
+batch: '001'
+files:
+- path: output/review/chapter-review.json
+  sha256: 80948cc93c1063c337480ed1989fc95f6535540d146aab60d6c69479357e2697
+  size: '57'
+timestamp: '2026-06-14T06:44:09+08:00'
+extras:
+  token_usage:
+    input: 50
+    output: 80

@@ -1,0 +1,40 @@
+current_stage: null
+pipeline_version: '1.0'
+started_at: 2026-06-14T06:44:09+0800
+last_checkpoint_at: '2026-06-14T06:44:09+08:00'
+progress:
+  outline: pending
+  characters: pending
+  simulation: pending
+  chapters_written: 0
+  chapters_reviewed: 0
+  total_words: 0
+recovery:
+  last_batch_chapters: []
+  last_batch_status: fresh_start
+  last_decision_reason: fresh_start
+token_usage:
+  total_input: 200
+  total_output: 320
+last_review_iterations: 0
+paused: false
+paused_reason: null
+forced_stage: null
+extra:
+  stage_attempts:
+    generate_outline: 0
+    design_characters: 0
+    write_chapter: 0
+    review_chapter: 0
+  artifacts:
+    generate_outline:
+      outline: chapters-outline/outline.md
+    design_characters:
+      characters:
+      - characters/alice.md
+      - characters/bob.md
+      - characters/carol.md
+    write_chapter:
+      chapter: output/chapters/001.md
+    review_chapter:
+      review: output/review/chapter-review.json

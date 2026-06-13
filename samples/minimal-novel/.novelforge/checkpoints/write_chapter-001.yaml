@@ -1,0 +1,11 @@
+stage: write_chapter
+batch: '001'
+files:
+- path: output/chapters/001.md
+  sha256: 44a86cba25a1bab19022890e9d971d4edfec6cd8d4dcdf81aea2a5885aa35a4f
+  size: '2986'
+timestamp: '2026-06-14T06:44:09+08:00'
+extras:
+  token_usage:
+    input: 50
+    output: 80
