@@ -11,7 +11,61 @@ novel:
     - CLAUDE.md
 
 pipeline:
-  template: "long-epic"
+  stages:
+    # --------------------------------------------------------------- #
+    # Stage 1: generate a short outline from the seeds.
+    # --------------------------------------------------------------- #
+    - id: generate_outline
+      model: claude-opus-4-7
+      prompt: prompts/generate-outline.md
+      produces:
+        - path: output/summaries/plot.md
+          alias: outline
+      done_when:
+        max_attempts: 3
+        checks:
+          - kind: min_chars
+            target: output/summaries/plot.md
+            value: 200
+          - kind: regex_match
+            target: output/summaries/plot.md
+            pattern: "## Chapter"
+
+    # --------------------------------------------------------------- #
+    # Stage 2: write a single chapter that consumes the outline.
+    # Demonstrates {{upstream.*}} placeholders + consumes: explicit list.
+    # --------------------------------------------------------------- #
+    - id: write_chapter
+      model: claude-opus-4-7
+      prompt: prompts/write-chapter.md
+      consumes: [generate_outline]
+      produces:
+        - path: output/chapters/001.md
+          alias: chapter
+      done_when:
+        max_attempts: 3
+        checks:
+          - kind: min_chars
+            target: output/chapters/001.md
+            value: 400
+
+    # --------------------------------------------------------------- #
+    # Stage 3: review the chapter.  Demonstrates consumes: [] (no
+    # upstream bindings) + a json_field check.
+    # --------------------------------------------------------------- #
+    - id: review_chapter
+      model: claude-sonnet-4-6
+      prompt: prompts/review-chapter.md
+      consumes: []
+      produces:
+        - path: output/review/chapter-review.json
+          alias: review
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: json_field
+            target: output/review/chapter-review.json
+            field: passed
 
 execution:
   batch_size:

@@ -1,339 +1,161 @@
-"""v4 CLI tests — init / migrate / validate upgrades."""
+"""Tests for the v4 CLI surface (Phase 3.7)."""
 
 from __future__ import annotations
 
-import json
-import shutil
 from pathlib import Path
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
-from novelforge.cli import app
+from novelforge import cli
 
 
 runner = CliRunner()
 
 
 # --------------------------------------------------------------------------- #
-# help
+# Command surface
 # --------------------------------------------------------------------------- #
 
 
-def test_help_lists_v4_subcommands() -> None:
-    result = runner.invoke(app, ["--help"])
-    assert result.exit_code == 0
-    for cmd in ("init", "migrate", "validate", "run", "resume", "status"):
-        assert cmd in result.stdout, f"missing {cmd!r} in --help"
+def test_no_migrate_command_registered() -> None:
+    """The v3 ``migrate`` command must not exist."""
+
+    names = {cmd.name or cmd.callback.__name__.replace("_", "-")
+             for cmd in cli.app.registered_commands}
+    # Some typer versions populate .name differently; fall back to the
+    # callback name lookup.
+    callbacks = [c.callback.__name__ for c in cli.app.registered_commands if c.callback]
+    assert "migrate" not in names
+    assert "migrate" not in callbacks
 
 
-def test_init_help_present() -> None:
-    result = runner.invoke(app, ["init", "--help"])
-    assert result.exit_code == 0
-    assert "--template" in result.stdout
-    assert "--dir" in result.stdout
+def test_no_v3_helpers_in_cli_source() -> None:
+    """v3 helpers must be gone; comments and docstring mentions are OK."""
 
-
-def test_migrate_help_present() -> None:
-    result = runner.invoke(app, ["migrate", "--help"])
-    assert result.exit_code == 0
-    assert "--out" in result.stdout
-    assert "--write" in result.stdout
-
-
-# --------------------------------------------------------------------------- #
-# validate
-# --------------------------------------------------------------------------- #
-
-
-def test_validate_legacy_yaml_succeeds_with_warning(tmp_path: Path) -> None:
-    """A1: legacy yaml with ``template:`` should validate with a
-    deprecation warning."""
-
-    (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text("p", encoding="utf-8")
-    (tmp_path / "outline" / "world.md").write_text("w", encoding="utf-8")
-    (tmp_path / "CLAUDE.md").write_text("c", encoding="utf-8")
-    body = """
-novel:
-  title: "T"
-  genre: "x"
-  target_chapters: 1
-  words_per_chapter: [100, 200]
-  style: "x"
-  seeds: [outline/premise.md]
-  constraints: [CLAUDE.md]
-pipeline:
-  template: "long-epic"
-"""
-    cfg = tmp_path / "novel-project.yaml"
-    cfg.write_text(body, encoding="utf-8")
-    result = runner.invoke(app, ["validate", "--config", str(cfg)])
-    assert result.exit_code == 0, result.stdout
-    assert "Config OK" in result.stdout
-    assert "template" in result.stdout
-    assert "DeprecationWarning" in result.stdout
-
-
-def test_validate_v4_yaml_uses_scaffold_from(tmp_path: Path) -> None:
-    (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text("p", encoding="utf-8")
-    (tmp_path / "outline" / "world.md").write_text("w", encoding="utf-8")
-    (tmp_path / "CLAUDE.md").write_text("c", encoding="utf-8")
-    body = """
-novel:
-  title: "T"
-  genre: "x"
-  target_chapters: 1
-  words_per_chapter: [100, 200]
-  style: "x"
-  seeds: [outline/premise.md]
-  constraints: [CLAUDE.md]
-pipeline:
-  scaffold_from: "long-epic"
-  stages:
-    - id: write
-      model: m
-      prompt: p
-      output: o
-"""
-    cfg = tmp_path / "novel-project.yaml"
-    cfg.write_text(body, encoding="utf-8")
-    result = runner.invoke(app, ["validate", "--config", str(cfg)])
-    assert result.exit_code == 0
-    assert "scaffold_from" in result.stdout
-    # No deprecation warning for v4 yaml
-    assert "DeprecationWarning" not in result.stdout
-
-
-def test_validate_split_missing_field_reports(tmp_path: Path) -> None:
-    (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text("p", encoding="utf-8")
-    (tmp_path / "outline" / "world.md").write_text("w", encoding="utf-8")
-    (tmp_path / "CLAUDE.md").write_text("c", encoding="utf-8")
-    body = """
-novel:
-  title: "T"
-  genre: "x"
-  target_chapters: 1
-  words_per_chapter: [100, 200]
-  style: "x"
-  seeds: [outline/premise.md]
-  constraints: [CLAUDE.md]
-pipeline:
-  stages:
-    - id: write
-      model: m
-      prompt: p
-      output: "output/c-{{num:03d}}.md"
-"""
-    cfg = tmp_path / "novel-project.yaml"
-    cfg.write_text(body, encoding="utf-8")
-    result = runner.invoke(app, ["validate", "--config", str(cfg)])
-    assert result.exit_code == 2
-    combined = ((result.stdout or "") + (result.stderr or "")).lower()
-    assert "validation failed" in combined
+    src = (Path(__file__).resolve().parent.parent / "src" / "novelforge" / "cli.py").read_text()
+    # Strip comments / docstrings (anything starting with # or between
+    # triple quotes).  Crude but sufficient for this guard.
+    import re
+    cleaned = re.sub(r"#.*", "", src)
+    cleaned = re.sub(r'""".*?"""', "", cleaned, flags=re.DOTALL)
+    for forbidden in ("def migrate", "scaffold_from", "stages_override"):
+        assert forbidden not in cleaned, (
+            f"cli.py still references {forbidden!r} in code"
+        )
 
 
 # --------------------------------------------------------------------------- #
-# init
+# init command
 # --------------------------------------------------------------------------- #
 
 
-def test_init_long_epic_scaffolds_yaml_and_prompts(tmp_path: Path) -> None:
-    target = tmp_path / "project"
+def test_init_creates_yaml_and_prompts(tmp_path: Path) -> None:
+    project = tmp_path / "fresh"
     result = runner.invoke(
-        app, ["init", "--template", "long-epic", "--dir", str(target)]
+        cli.app,
+        ["init", "--template", "short-story", "--dir", str(project)],
     )
-    assert result.exit_code == 0, result.stdout
-    assert (target / "novel-project.yaml").exists()
-    prompts_dir = target / "prompts"
-    assert prompts_dir.exists()
-    # 10 stage prompts should be materialised
-    prompt_files = sorted(prompts_dir.glob("*.md"))
-    assert len(prompt_files) == 10
-    # scaffold_from is in the yaml
-    yaml_text = (target / "novel-project.yaml").read_text(encoding="utf-8")
-    assert "scaffold_from: long-epic" in yaml_text
-
-
-def test_init_then_validate_without_seeds(tmp_path: Path) -> None:
-    """A13 / spec §4.1: ``init`` followed by ``validate`` must succeed
-    even when the user has not yet supplied outline/ + CLAUDE.md.  The
-    engine surfaces missing files at the first {{include:}} stage.
-    """
-
-    target = tmp_path / "project"
-    init_result = runner.invoke(
-        app, ["init", "--template", "long-epic", "--dir", str(target)]
-    )
-    assert init_result.exit_code == 0, init_result.stdout
-    cfg = target / "novel-project.yaml"
-    validate_result = runner.invoke(app, ["validate", "--config", str(cfg)])
-    assert validate_result.exit_code == 0, (
-        validate_result.stdout + validate_result.stderr
-    )
-    assert "Config OK" in validate_result.stdout
-
-
-def test_init_refuses_to_overwrite(tmp_path: Path) -> None:
-    target = tmp_path / "project"
-    target.mkdir()
-    (target / "novel-project.yaml").write_text("novel: {}", encoding="utf-8")
-    result = runner.invoke(
-        app, ["init", "--template", "long-epic", "--dir", str(target)]
-    )
-    assert result.exit_code == 2
-    combined = (result.stdout or "") + (result.stderr or "")
-    assert "Refusing to overwrite" in combined or "Refusing" in combined
-
-
-def test_init_force_overwrites(tmp_path: Path) -> None:
-    target = tmp_path / "project"
-    target.mkdir()
-    (target / "novel-project.yaml").write_text("novel: {}", encoding="utf-8")
-    result = runner.invoke(
-        app,
-        [
-            "init",
-            "--template",
-            "long-epic",
-            "--dir",
-            str(target),
-            "--force",
-        ],
-    )
-    assert result.exit_code == 0, result.stdout
+    assert result.exit_code == 0, result.output
+    yaml_path = project / "novel-project.yaml"
+    assert yaml_path.exists()
+    raw = yaml.safe_load(yaml_path.read_text())
+    assert "pipeline" in raw
+    assert "stages" in raw["pipeline"]
+    assert "template" not in raw["pipeline"]
+    assert "scaffold_from" not in raw["pipeline"]
+    # Every stage has the contract fields.
+    for stage in raw["pipeline"]["stages"]:
+        assert "produces" in stage
+        assert "done_when" in stage
+    # Prompts materialised.
+    prompts_dir = project / "prompts"
+    assert prompts_dir.is_dir()
+    prompt_files = list(prompts_dir.glob("*.md"))
+    assert prompt_files
 
 
 def test_init_unknown_template_errors(tmp_path: Path) -> None:
-    target = tmp_path / "project"
+    project = tmp_path / "fresh"
     result = runner.invoke(
-        app, ["init", "--template", "bogus", "--dir", str(target)]
+        cli.app,
+        ["init", "--template", "non-existent", "--dir", str(project)],
     )
     assert result.exit_code == 2
-    combined = ((result.stdout or "") + (result.stderr or "")).lower()
-    assert "unknown template" in combined
+    assert "unknown template" in result.output.lower()
+
+
+def test_init_refuses_overwrite_without_force(tmp_path: Path) -> None:
+    project = tmp_path / "fresh"
+    project.mkdir()
+    (project / "novel-project.yaml").write_text("novel: x\n", encoding="utf-8")
+    result = runner.invoke(
+        cli.app,
+        ["init", "--template", "short-story", "--dir", str(project)],
+    )
+    assert result.exit_code == 2
+    assert "overwrite" in result.output.lower()
+
+
+def test_init_force_overwrites(tmp_path: Path) -> None:
+    project = tmp_path / "fresh"
+    project.mkdir()
+    (project / "novel-project.yaml").write_text("old\n", encoding="utf-8")
+    result = runner.invoke(
+        cli.app,
+        ["init", "--template", "short-story", "--dir", str(project), "--force"],
+    )
+    assert result.exit_code == 0
+    raw = yaml.safe_load((project / "novel-project.yaml").read_text())
+    assert "pipeline" in raw
 
 
 # --------------------------------------------------------------------------- #
-# migrate
+# validate command
 # --------------------------------------------------------------------------- #
 
 
-def _write_legacy(tmp_path: Path) -> Path:
-    (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text("p", encoding="utf-8")
-    (tmp_path / "outline" / "world.md").write_text("w", encoding="utf-8")
-    (tmp_path / "CLAUDE.md").write_text("c", encoding="utf-8")
-    body = """
+_VALID_YAML = """
 novel:
-  title: "T"
-  genre: "x"
+  title: T
+  genre: T
   target_chapters: 1
-  words_per_chapter: [200, 400]
-  style: "lean"
-  seeds: [outline/premise.md, outline/world.md]
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
   constraints: [CLAUDE.md]
 pipeline:
-  template: "long-epic"
-execution:
-  max_review_iterations: 5
+  stages:
+    - id: a
+      model: m
+      prompt: A.
+      produces:
+        - path: output/a.md
+          alias: a
 """
+
+
+def test_validate_accepts_v4_yaml(tmp_path: Path) -> None:
     cfg = tmp_path / "novel-project.yaml"
-    cfg.write_text(body, encoding="utf-8")
-    return cfg
+    cfg.write_text(_VALID_YAML, encoding="utf-8")
+    result = runner.invoke(cli.app, ["validate", "--config", str(cfg)])
+    assert result.exit_code == 0
+    assert "Config OK" in result.output
 
 
-def test_migrate_dry_run_to_stdout(tmp_path: Path) -> None:
-    cfg = _write_legacy(tmp_path)
-    result = runner.invoke(app, ["migrate", "--config", str(cfg)])
-    assert result.exit_code == 0, result.stdout
-    # The output is the v4 yaml payload
-    assert "scaffold_from: long-epic" in result.stdout
-    assert "stages:" in result.stdout
-    # The source file is untouched
-    assert "template: \"long-epic\"" in cfg.read_text(encoding="utf-8")
-
-
-def test_migrate_with_out_writes_to_new_file(tmp_path: Path) -> None:
-    cfg = _write_legacy(tmp_path)
-    out = tmp_path / "migrated.yaml"
+def test_validate_rejects_missing_file(tmp_path: Path) -> None:
     result = runner.invoke(
-        app, ["migrate", "--config", str(cfg), "--out", str(out)]
-    )
-    assert result.exit_code == 0, result.stdout
-    assert out.exists()
-    # prompts/ directory was also materialised
-    assert (tmp_path / "prompts").exists()
-    # Source yaml was NOT overwritten
-    raw = cfg.read_text(encoding="utf-8")
-    assert "template: \"long-epic\"" in raw
-    # The migrated yaml has the v4 shape
-    migrated = yaml.safe_load(out.read_text(encoding="utf-8"))
-    assert "stages" in migrated["pipeline"]
-    assert migrated["pipeline"]["scaffold_from"] == "long-epic"
-    # user-defined execution fields preserved
-    assert migrated["execution"]["max_review_iterations"] == 5
-
-
-def test_migrate_write_in_place_with_backup(tmp_path: Path) -> None:
-    cfg = _write_legacy(tmp_path)
-    result = runner.invoke(
-        app, ["migrate", "--config", str(cfg), "--write"]
-    )
-    assert result.exit_code == 0, result.stdout
-    bak = cfg.with_suffix(cfg.suffix + ".bak")
-    assert bak.exists()
-    # The yaml was overwritten with the v4 form
-    raw = cfg.read_text(encoding="utf-8")
-    assert "scaffold_from" in raw
-    assert "stages:" in raw
-    # The .bak file is the old content
-    assert "template:" in bak.read_text(encoding="utf-8")
-
-
-def test_migrate_out_and_write_are_mutually_exclusive(tmp_path: Path) -> None:
-    cfg = _write_legacy(tmp_path)
-    out = tmp_path / "new.yaml"
-    result = runner.invoke(
-        app,
-        [
-            "migrate",
-            "--config",
-            str(cfg),
-            "--out",
-            str(out),
-            "--write",
-        ],
-    )
-    assert result.exit_code == 2
-    combined = ((result.stdout or "") + (result.stderr or "")).lower()
-    assert "mutually exclusive" in combined
-    # No files were created/modified
-    assert not out.exists()
-    assert not (tmp_path / "prompts").exists()
-
-
-def test_migrate_missing_file_errors(tmp_path: Path) -> None:
-    result = runner.invoke(
-        app, ["migrate", "--config", str(tmp_path / "nope.yaml")]
+        cli.app, ["validate", "--config", str(tmp_path / "absent.yaml")]
     )
     assert result.exit_code == 2
 
 
-# --------------------------------------------------------------------------- #
-# Stage classes still importable (T15: deprecation path)
-# ------------------------------------------------------------------------── #
-
-
-def test_legacy_stage_classes_still_importable() -> None:
-    import warnings
-
-    from novelforge.stages import WriteChapterStage  # noqa: F401
-
-    with warnings.catch_warnings():
-        # We expect a DeprecationWarning here; record it.
-        warnings.simplefilter("ignore", DeprecationWarning)
-        from novelforge.stages import GenerateOutlineStage  # noqa: F401
+def test_validate_rejects_v3_template_field(tmp_path: Path) -> None:
+    cfg = tmp_path / "novel-project.yaml"
+    cfg.write_text(
+        "novel:\n  title: x\npipeline:\n  template: long-epic\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(cli.app, ["validate", "--config", str(cfg)])
+    assert result.exit_code == 2

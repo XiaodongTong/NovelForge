@@ -1,8 +1,8 @@
 # NovelForge — AI 无人值守小说创作引擎 设计方案
 
-> **状态**：本文件是早期 v3 阶段的架构愿景与模块设计。当前运行时模型已升级到 **v4**（统一 `pipeline.stages` 8 字段 + `GenericStage`）；用户/贡献者编写 `novel-project.yaml` 与阅读 stage schema 时，请以 [`pipeline-customization.md`](./pipeline-customization.md) 为准。
+> **状态**：本文件是早期 v3 阶段的架构愿景与模块设计。当前运行时模型已升级到 **v4 stage 契约协议**；用户/贡献者编写 `novel-project.yaml` 与阅读 stage schema 时，请以 [`stage-contract.md`](./stage-contract.md) 为准（**权威文档**）。
 >
-> 本文件保留作为架构愿景与模块布局参考；其中的 yaml / stage / review 示例属 v3 形态，**不应**直接复制到 v4 配置里。
+> 本文件保留作为架构愿景与模块布局参考；其中的 yaml / stage / review 示例属 v3 形态，**不应**直接复制到 v4 配置里。v3 的 `pipeline.template` / `stages_override` / `scaffold_from` 字段以及 `route` 跳转机制均已删除（详见 [stage-contract.md](./stage-contract.md) §八）。[`pipeline-customization.md`](./pipeline-customization.md) 已归档为 v3 历史方案。
 
 ## 一、系统定位
 

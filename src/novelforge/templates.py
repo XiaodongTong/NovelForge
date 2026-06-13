@@ -1,324 +1,356 @@
-"""Built-in pipeline templates (v4 data source).
+"""Built-in pipeline templates (v4 contract model).
 
-Templates used to live as a list of stage ids in :mod:`novelforge.config`
-and as individual Python classes in :mod:`novelforge.stages`.  v4
-unifies the data model: every stage — whether the user wrote it by hand
-or it came from ``init``/``migrate`` — is an 8-field :class:`StageConfig`
-record (see :mod:`novelforge.config`).
+The runtime consumes :class:`novelforge.config.StageConfig` records;
+this module is the **default data source** for ``novelforge init``.
+Each built-in template is a named bundle of stages described entirely
+in the v4 contract form (``produces`` / ``done_when`` / ``consumes``).
 
-This module is the **only** place the engine stores the v3 built-in
-prompts and the per-stage defaults.  ``init`` uses it to materialise a
-fresh project; ``migrate`` uses it to upgrade a v3 yaml; the runtime
-falls back to it when the user supplies only ``template: long-epic``
-in their yaml (with a DeprecationWarning, per spec §5.5.1).
+Two templates ship out of the box:
+
+- ``long-epic``  — outline → characters → batch chapters → review.
+- ``short-story`` — a leaner variant with a single non-batch write step.
+
+The legacy ``PIPELINE_TEMPLATES`` mapping (v3 stage-id tuples) and the
+old :class:`StageTemplate` record (8 imperative fields) have been
+removed; ``init`` now materialises the contract record straight into
+the user's ``novel-project.yaml``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping
 
-# Stage ids covered by the v3 stage classes.  v4 still has to be able to
-# scaffold them when a user runs ``init --template long-epic`` on a
-# clean directory.
-ALL_STAGE_IDS: tuple[str, ...] = (
-    "generate_outline",
-    "review_outline",
-    "design_characters",
-    "review_characters",
-    "simulate_plot",
-    "review_simulation",
-    "write_chapter",
-    "review_chapter",
-    "full_consistency_check",
-    "final_polish",
+from .config import (
+    CheckSpec,
+    DoneWhenSpec,
+    ProduceSpec,
+    StageConfig,
+    validate_stage,
 )
+from .errors import ConfigError
 
-# Built-in templates map → ordered list of stage ids.  The runtime
-# never reads these directly (the orchestrator consumes
-# ``PipelineSpec.stages``) but ``init`` / ``migrate`` need them.
-PIPELINE_TEMPLATES: dict[str, tuple[str, ...]] = {
-    "long-epic": (
-        "generate_outline",
-        "review_outline",
-        "design_characters",
-        "review_characters",
-        "simulate_plot",
-        "review_simulation",
-        "write_chapter",
-        "review_chapter",
-        "full_consistency_check",
-        "final_polish",
-    ),
-    "short-story": (
-        "generate_outline",
-        "review_outline",
-        "design_characters",
-        "review_characters",
-        "write_chapter",
-        "review_chapter",
-        "final_polish",
-    ),
-    "series": (
-        "generate_outline",
-        "review_outline",
-        "design_characters",
-        "review_characters",
-        "simulate_plot",
-        "review_simulation",
-        "write_chapter",
-        "review_chapter",
-        "full_consistency_check",
-    ),
-}
-
-VALID_TEMPLATES: frozenset[str] = frozenset(PIPELINE_TEMPLATES)
+__all__ = [
+    "ContractTemplate",
+    "BUILTIN_TEMPLATES",
+    "VALID_TEMPLATES",
+    "get_template",
+]
 
 
 # --------------------------------------------------------------------------- #
-# Stage template record
+# ContractTemplate
 # --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
-class StageTemplate:
-    """A single stage's v4 defaults.
+class ContractTemplate:
+    """A named bundle of v4 :class:`StageConfig` records.
 
-    Mirrors :class:`novelforge.config.StageConfig` field-for-field so
-    that ``init`` / ``migrate`` can lift the record into the user's
-    yaml with no transformation.  ``prompt_text`` is the inline prompt
-    body; ``init`` writes it to ``prompts/<prompt_file>`` and sets
-    ``prompt`` to the relative path.
+    ``init`` consumes this directly: each stage's ``prompt_text`` is
+    materialised to ``prompts/<prompt_file>`` and the stage record is
+    dumped to ``novel-project.yaml``.
     """
 
-    id: str
-    model: str
-    prompt_text: str
-    output: str
-    split: Optional[str] = None
-    batch: int = 1
-    on_failure: str = "pause"
-    enabled: bool = True
-    # ---- migration helpers ----
-    # The recommended file name when materialising ``prompt_text`` to
-    # the project's prompts/ directory.  Derived from the stage id.
-    prompt_file: str = field(default="")
+    name: str
+    description: str
+    stages: tuple[StageConfig, ...]
+    # Per-stage prompt text keyed by stage id.  ``init`` writes these
+    # to ``prompts/<prompt_file>`` and the stage's ``prompt`` field is
+    # set to that relative path.
+    prompts: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # frozen dataclass: mutate via object.__setattr__.
-        if not self.prompt_file:
-            object.__setattr__(self, "prompt_file", _id_to_prompt_file(self.id))
+        if not self.stages:
+            raise ConfigError(
+                f"template {self.name!r}: at least one stage is required"
+            )
+        # Cross-stage validation — surface config errors eagerly so a
+        # misconfigured built-in template fails at import time.
+        for s in self.stages:
+            errs = validate_stage(s)
+            if errs:
+                raise ConfigError(
+                    f"template {self.name!r}: stage {s.id!r} failed "
+                    f"validation: {errs}"
+                )
 
-    def to_dict(self) -> dict[str, Any]:
-        """Render as a v4 yaml-ready mapping (prompt inlined)."""
+    def stage_ids(self) -> list[str]:
+        return [s.id for s in self.stages]
 
-        d: dict[str, Any] = {
-            "id": self.id,
-            "model": self.model,
-            "prompt": self.prompt_text,
-            "output": self.output,
-        }
-        if self.split:
-            d["split"] = self.split
-        if self.batch != 1:
-            d["batch"] = self.batch
-        if self.on_failure != "pause":
-            d["on_failure"] = self.on_failure
-        if not self.enabled:
-            d["enabled"] = self.enabled
-        return d
+    def to_payload(self) -> list[dict[str, Any]]:
+        """Render the template as a list of stage mappings for yaml."""
+
+        out: list[dict[str, Any]] = []
+        for stage in self.stages:
+            entry: dict[str, Any] = {
+                "id": stage.id,
+                "model": stage.model,
+                # Always reference the prompts/<file>.md so the user
+                # can edit the prompt without touching yaml.
+                "prompt": _prompt_file_for(stage.id),
+                "produces": [p.to_dict() for p in stage.produces],
+                "done_when": stage.done_when.to_dict(),
+            }
+            if stage.consumes is not None:
+                entry["consumes"] = list(stage.consumes)
+            if stage.batch != 1:
+                entry["batch"] = stage.batch
+            if stage.on_failure != "pause":
+                entry["on_failure"] = stage.on_failure
+            if not stage.enabled:
+                entry["enabled"] = False
+            out.append(entry)
+        return out
 
 
-def _id_to_prompt_file(stage_id: str) -> str:
-    """Map a stage id to the conventional prompt filename.
-
-    e.g. ``write_chapter`` → ``write-chapter.md``.  Single source of
-    truth so ``init`` writes the same filename the runtime would
-    expect.
-    """
-
+def _prompt_file_for(stage_id: str) -> str:
     return stage_id.replace("_", "-") + ".md"
 
 
 # --------------------------------------------------------------------------- #
-# Default stage templates (10 stages, the long-epic set)
+# Built-in stages (reusable building blocks)
 # --------------------------------------------------------------------------- #
 
 
-STAGE_TEMPLATES: tuple[StageTemplate, ...] = (
-    StageTemplate(
+_DEFAULT_REVIEW_MODEL = "claude-sonnet-4-6"
+_DEFAULT_WRITE_MODEL = "claude-opus-4-7"
+
+
+def _outline_stage() -> StageConfig:
+    return StageConfig(
         id="generate_outline",
-        model="claude-opus-4-7",
-        output="output/summaries/plot.md",
-        prompt_text=(
-            "You are a senior webnovel planner.  Produce:\n\n"
-            "1. A high-level plot arc (themes, antagonists, the "
-            "protagonist's inner arc).\n"
-            "2. A chapter-by-chapter outline with one "
-            "``## Chapter N - <title>`` heading for every chapter in the "
-            "target, each followed by 1-2 sentences describing the key "
-            "beat.\n\n"
-            "Do not write prose.  Output markdown only."
+        model=_DEFAULT_WRITE_MODEL,
+        prompt="prompts/generate-outline.md",
+        produces=(
+            ProduceSpec(path="output/summaries/plot.md", alias="outline"),
         ),
-    ),
-    StageTemplate(
-        id="review_outline",
-        model="claude-sonnet-4-6",
-        output="output/review/outline-review.json",
-        prompt_text=(
-            "You are a senior webnovel editor.  Review the outline above "
-            "and return a JSON object with:\n\n"
-            "- ``passed``: boolean\n"
-            "- ``route``: ``\"done\"`` (approved) or the id of the stage "
-            "to revisit (e.g. ``\"generate_outline\"``)\n"
-            "- ``findings``: list of strings\n"
-            "- ``required_changes``: list of strings\n"
-            "- ``summary``: short paragraph\n\n"
-            "Be strict: any plot hole or pacing issue must be flagged.  "
-            "Output only the JSON object."
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/summaries/plot.md",
+                    value=500,
+                ),
+            ),
         ),
-    ),
-    StageTemplate(
+    )
+
+
+def _characters_stage() -> StageConfig:
+    return StageConfig(
         id="design_characters",
-        model="claude-opus-4-7",
-        output="output/meta/characters.md",
-        prompt_text=(
-            "You are a character designer for a long-form webnovel.  Read "
-            "the outline above and produce a dossier for every named "
-            "character.  Use the format:\n\n"
-            "# <Character Name>\n\n"
-            "**Role**: ...\n"
-            "**Voice**: ...\n"
-            "**Relationships**: ...\n"
-            "**Arc**: ...\n\n"
-            "One dossier per character, separated by a single blank "
-            "line.  Output only the dossiers."
+        model=_DEFAULT_WRITE_MODEL,
+        prompt="prompts/design-characters.md",
+        consumes=("generate_outline",),
+        produces=(
+            ProduceSpec(path="output/meta/characters.md", alias="characters"),
         ),
-    ),
-    StageTemplate(
-        id="review_characters",
-        model="claude-sonnet-4-6",
-        output="output/review/characters-review.json",
-        prompt_text=(
-            "Review the character dossiers above and return a JSON "
-            "object with ``passed``, ``route``, ``findings``, "
-            "``required_changes`` and ``summary`` fields.  Set "
-            "``route`` to ``\"done\"`` when the dossiers are ready."
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/meta/characters.md",
+                    value=300,
+                ),
+            ),
         ),
-    ),
-    StageTemplate(
-        id="simulate_plot",
-        model="claude-opus-4-7",
-        output="output/summaries/plot-simulation.md",
-        prompt_text=(
-            "Act as a \"table read\" reviewer.  Walk through the outline "
-            "chapter by chapter and identify:\n\n"
-            "- escalation gaps (where the tension does not compound)\n"
-            "- foreshadowing payoffs (what was set up, when it lands)\n"
-            "- character motivation issues (where behaviour feels "
-            "forced)\n"
-            "- chapter-level pacing notes\n\n"
-            "Output a single markdown file with one section per topic."
-        ),
-    ),
-    StageTemplate(
-        id="review_simulation",
-        model="claude-sonnet-4-6",
-        output="output/review/simulation-review.json",
-        prompt_text=(
-            "Review the plot simulation above and return a JSON object "
-            "with ``passed``, ``route``, ``findings``, "
-            "``required_changes`` and ``summary`` fields.  Set "
-            "``route`` to ``\"done\"`` when the simulation is sound."
-        ),
-    ),
-    StageTemplate(
+    )
+
+
+def _write_chapter_batch_stage() -> StageConfig:
+    return StageConfig(
         id="write_chapter",
-        model="claude-opus-4-7",
-        output="output/chapters/{{num:03d}}-{{title|slug}}.md",
-        split=(
-            r"^#\s+[Cc]hapter\s+"
-            r"(?P<num>\d+)\s*[-–—:]?\s*"
-            r"(?P<title>.+?)\s*$"
+        model=_DEFAULT_WRITE_MODEL,
+        prompt="prompts/write-chapter.md",
+        consumes=("generate_outline", "design_characters"),
+        produces=(
+            ProduceSpec(
+                path="output/chapters/{{num:03d}}.md", alias="chapter"
+            ),
         ),
-        batch=1,
-        prompt_text=(
-            "Write the next chapter(s) of the novel.  Use the outline "
-            "beat above as your target.  Output ``# Chapter N - <Title>`` "
-            "followed by 800-1500 Chinese characters of prose per "
-            "chapter.  End on a small reversal."
+        batch=3,
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/chapters/{{num:03d}}.md",
+                    value=1000,
+                ),
+            ),
         ),
-    ),
-    StageTemplate(
+    )
+
+
+def _write_chapter_single_stage() -> StageConfig:
+    return StageConfig(
+        id="write_chapter",
+        model=_DEFAULT_WRITE_MODEL,
+        prompt="prompts/write-chapter.md",
+        consumes=("generate_outline",),
+        produces=(
+            ProduceSpec(
+                path="output/chapters/001.md", alias="chapter"
+            ),
+        ),
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/chapters/001.md",
+                    value=500,
+                ),
+            ),
+        ),
+    )
+
+
+def _review_chapter_stage() -> StageConfig:
+    return StageConfig(
         id="review_chapter",
-        model="claude-sonnet-4-6",
-        output="output/review/chapter-review.json",
-        prompt_text=(
-            "You are reviewing the latest chapter.  Return a JSON object "
-            "with the keys ``passed``, ``route``, ``findings``, "
-            "``required_changes`` and ``summary``.  Set ``route`` to "
-            "``\"write_chapter`` if the chapter needs a rewrite, or "
-            "``\"done`` if it can move on."
+        model=_DEFAULT_REVIEW_MODEL,
+        prompt="prompts/review-chapter.md",
+        consumes=("write_chapter",),
+        produces=(
+            ProduceSpec(
+                path="output/review/chapter-review.json",
+                alias="chapter_review",
+            ),
         ),
-    ),
-    StageTemplate(
-        id="full_consistency_check",
-        model="claude-sonnet-4-6",
-        output="output/review/consistency-report.md",
-        prompt_text=(
-            "Read the outline and all chapter files.  Produce a "
-            "consistency report covering:\n\n"
-            "- Character name & trait consistency\n"
-            "- Foreshadowing payoff (every setup has a corresponding "
-            "pay-off)\n"
-            "- Timeline continuity\n"
-            "- World rule violations\n\n"
-            "Be terse and list every issue with a chapter reference.  "
-            "If nothing is wrong, say so explicitly."
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="json_field",
+                    target="output/review/chapter-review.json",
+                    field="passed",
+                ),
+            ),
         ),
-    ),
-    StageTemplate(
+    )
+
+
+def _final_polish_stage() -> StageConfig:
+    return StageConfig(
         id="final_polish",
-        model="claude-opus-4-7",
-        output="output/review/final-polish-notes.md",
-        prompt_text=(
-            "Read the manuscript and produce a final-polish brief.  For "
-            "every chapter, list at most three tweaks (word choice, "
-            "sentence rhythm, clarity).  Be terse.  Output markdown."
+        model=_DEFAULT_WRITE_MODEL,
+        prompt="prompts/final-polish.md",
+        consumes=("write_chapter",),
+        produces=(
+            ProduceSpec(
+                path="output/review/final-polish-notes.md",
+                alias="polish_notes",
+            ),
         ),
-    ),
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/review/final-polish-notes.md",
+                    value=200,
+                ),
+            ),
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Built-in prompts (one per stage)
+# --------------------------------------------------------------------------- #
+
+
+_PROMPT_OUTLINE = (
+    "You are a senior webnovel planner.  Using the seeds and constraints "
+    "provided, produce a chapter-by-chapter outline.  Use ``## Chapter N - "
+    "<title>`` headings with 1-2 sentences per chapter describing the key "
+    "beat.  Output markdown only."
 )
 
-# Sanity: every built-in id from PIPELINE_TEMPLATES has a template.
-_TEMPLATES_BY_ID: dict[str, StageTemplate] = {t.id: t for t in STAGE_TEMPLATES}
-for _tid in ALL_STAGE_IDS:
-    if _tid not in _TEMPLATES_BY_ID:  # pragma: no cover - guard
-        raise RuntimeError(f"templates.py missing record for {_tid}")
+_PROMPT_CHARACTERS = (
+    "Read the upstream outline at {{upstream.generate_outline.outline}} and "
+    "design a character dossier for every named character.  Use:\n\n"
+    "# <Character Name>\n**Role**: ...\n**Voice**: ...\n"
+    "**Relationships**: ...\n**Arc**: ...\n\n"
+    "One dossier per character; output markdown only."
+)
+
+_PROMPT_WRITE_CHAPTER = (
+    "Write the next chapter of the novel.  Use the outline beat above as "
+    "your target.  Output 800-1500 Chinese characters of prose and end on "
+    "a small reversal."
+)
+
+_PROMPT_REVIEW_CHAPTER = (
+    "Review the chapter at {{upstream.write_chapter.chapter[*]}}.  Return a "
+    "JSON object with: passed (boolean), findings (list), "
+    "required_changes (list), summary (string).  Set passed=true when the "
+    "chapter is acceptable."
+)
+
+_PROMPT_FINAL_POLISH = (
+    "Read the manuscript chapters at "
+    "{{upstream.write_chapter.chapter[*]}} and produce a final-polish "
+    "brief.  For every chapter, list at most three tweaks (word choice, "
+    "rhythm, clarity).  Output markdown."
+)
 
 
-def get_template(stage_id: str) -> StageTemplate:
-    """Return the built-in template for ``stage_id``.
-
-    Raises ``KeyError`` if the id is not in :data:`STAGE_TEMPLATES`.
-    """
-
-    return _TEMPLATES_BY_ID[stage_id]
+# --------------------------------------------------------------------------- #
+# Built-in templates
+# --------------------------------------------------------------------------- #
 
 
-def get_template_mapping(
-    stage_ids: Sequence[str],
-) -> dict[str, StageTemplate]:
-    """Return ``{stage_id: template}`` for each id in ``stage_ids``."""
+_LONG_EPIC = ContractTemplate(
+    name="long-epic",
+    description=(
+        "Outline → characters → batch chapters → review → final polish.  "
+        "Suitable for a multi-chapter webnovel."
+    ),
+    stages=(
+        _outline_stage(),
+        _characters_stage(),
+        _write_chapter_batch_stage(),
+        _review_chapter_stage(),
+        _final_polish_stage(),
+    ),
+    prompts={
+        "generate_outline": _PROMPT_OUTLINE,
+        "design_characters": _PROMPT_CHARACTERS,
+        "write_chapter": _PROMPT_WRITE_CHAPTER,
+        "review_chapter": _PROMPT_REVIEW_CHAPTER,
+        "final_polish": _PROMPT_FINAL_POLISH,
+    },
+)
 
-    return {sid: _TEMPLATES_BY_ID[sid] for sid in stage_ids}
+
+_SHORT_STORY = ContractTemplate(
+    name="short-story",
+    description=(
+        "Outline → single chapter.  A leaner pipeline for short pieces."
+    ),
+    stages=(
+        _outline_stage(),
+        _write_chapter_single_stage(),
+    ),
+    prompts={
+        "generate_outline": _PROMPT_OUTLINE,
+        "write_chapter": _PROMPT_WRITE_CHAPTER,
+    },
+)
 
 
-__all__ = [
-    "ALL_STAGE_IDS",
-    "PIPELINE_TEMPLATES",
-    "VALID_TEMPLATES",
-    "STAGE_TEMPLATES",
-    "StageTemplate",
-    "get_template",
-    "get_template_mapping",
-]
+BUILTIN_TEMPLATES: dict[str, ContractTemplate] = {
+    t.name: t for t in (_LONG_EPIC, _SHORT_STORY)
+}
+
+VALID_TEMPLATES: frozenset[str] = frozenset(BUILTIN_TEMPLATES)
+
+
+def get_template(name: str) -> ContractTemplate:
+    """Return the built-in :class:`ContractTemplate` named ``name``."""
+
+    if name not in BUILTIN_TEMPLATES:
+        raise ConfigError(
+            f"unknown template {name!r}; "
+            f"expected one of: {sorted(BUILTIN_TEMPLATES)}"
+        )
+    return BUILTIN_TEMPLATES[name]

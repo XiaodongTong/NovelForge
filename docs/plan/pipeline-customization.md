@@ -1,5 +1,21 @@
-# Pipeline 自定义与 Stage 属性统一化方案
+# Pipeline 自定义与 Stage 属性统一化方案（v3 历史，已归档）
 
+> ⚠️ **本文档已归档为 v3 历史，仅供回溯设计动机参考。**
+>
+> v3 设计已被 [stage-contract.md](./stage-contract.md) 取代。当前运行时模型是 **v4 stage 契约协议**：
+> - 删除了 8 字段方案中的 `output` / `split` 顶层字段，改为 `produces` 复数 + `produces[].split` 内联
+> - 删除了 `route` 跳 stage id 的路由机制，改为纯线性流水线
+> - 删除了 `template` / `stages_override` / `scaffold_from` 字段
+> - 删除了 10 个内置 stage 类，唯一执行器是 `GenericStage`
+> - 新增了 `done_when`（双层完成校验）与 `consumes`（数据流依赖）两个 stage 字段
+> - 新增了 `ArtifactRegistry` 与 `{{upstream.*}}` 占位符
+>
+> **请勿按本文档的 yaml 形态编写新配置**；以 [stage-contract.md](./stage-contract.md) 为准。
+>
+> ---
+>
+> 原始元信息（v3 阶段）：
+>
 > 状态：v4 已落地（2026-06-13）
 > 作者：NovelForge 设计组
 > 日期：2026-06-11（v4 落地：2026-06-13）

@@ -1,80 +1,79 @@
-"""Pipeline orchestrator.
+"""Pipeline orchestrator (v4 contract model).
 
-Drives the FSM: assemble context → invoke Claude → parse contract →
-checkpoint → route → save state.  Public surface is :class:`Orchestrator`
-plus a small dataclass for the run summary.
+Drives the contract pipeline: for each :class:`StageConfig`, the
+orchestrator walks the dual-layer retry matrix (A-tier infrastructure
+errors + C-tier model-incomplete errors), drives batch stages item by
+item, persists progress to ``state.yaml``, and registers each
+successful produce in the :class:`ArtifactRegistry`.
 
-The orchestrator is deliberately stage-agnostic: it talks to stages
-through the :class:`Stage` interface and to the model through the
-:class:`ClaudeAdapter` interface.  This keeps tests focused and the
-implementation substitutable.
+Highlights (spec §5.4 / plan D3-D14):
 
-v4 routing (plan §C, spec §5.2):
+- **Single GenericStage instance** — every step is driven through the
+  same :class:`GenericStage` executor; the per-step behaviour comes
+  from :class:`StageConfig`.
+- **Dual-layer retry** —
 
-- The orchestrator iterates :class:`StageConfig` records rather than
-  hard-coded stage ids.
-- After each stage, the next stage is chosen by:
-  1. If the stage's output was JSON and the JSON contains a ``route``
-     field whose value is a known, enabled stage id → jump there.
-  2. Otherwise → the next stage in the resolved stage list.
-- A ``route_history`` counter is maintained so repeated jumps
-  (write ↔ review loops) are bounded by
-  ``execution.max_review_iterations``; on overflow the current
-  stage's ``on_failure`` disposition is applied (default: pause).
-- ``enabled: false`` stages are skipped wholesale: no Claude call,
-  no product file, no batch tick.  A jump to a disabled stage is
-  counted in ``route_history`` (so a misconfigured prompt cannot
-  bypass the loop ceiling — A17) and triggers ``on_failure``.
+  * A-tier (``RateLimited`` / ``WriteFailure`` / ``ContextOverflow``)
+    is handled by :meth:`_execute_with_retry`'s inner loop with the
+    configured backoff (``execution.retry``); does **not** increment
+    the C-tier counter.
+  * C-tier (``StageIncomplete`` / ``VerifyFailed``) is handled by the
+    outer loop; each failure injects an ``attempt_hint`` and retries
+    up to ``done_when.max_attempts``; on exhaustion the stage's
+    ``on_failure`` disposition applies.
 
-Backward compatibility (spec §5.5.1, A1):
-
-- v3 yaml (``pipeline.template`` only, or ``template`` +
-  ``stages_override``) is still loaded; the orchestrator uses the
-  legacy v3 stage classes so the existing test suite keeps passing.
-- Deprecation warnings for the v3 fields are emitted at run start
-  (see :func:`novelforge.config.deprecation_warnings_for`).
+- **Batch driving** — a ``batch: N`` stage runs N times in series,
+  with each item getting its own ``StageContext.batch`` (``"001"``,
+  ``"002"``, …) and its own entry in ``state.extra.stage_attempts``
+  (``list[int]`` of length N).  A non-batch stage stores a single
+  ``int`` (plan D14).
+- **State persistence** — every successful produce is registered in
+  the :class:`ArtifactRegistry` and serialised to
+  ``state.extra.artifacts`` so checkpoints / resumes see a consistent
+  view.
+- **Purely linear pipeline** — v3 routing tokens are gone; the next
+  stage is always the next entry in ``pipeline.stages`` (spec §AC-15,
+  §AC-18).
 """
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
-from .claude.adapter import ClaudeAdapter, ClaudeCLIAdapter, MockClaudeAdapter
-from .claude.context import ContextAssembler
+from .artifact_registry import ArtifactRegistry
+from .claude.adapter import (
+    ClaudeAdapter,
+    ClaudeCLIAdapter,
+    MockClaudeAdapter,
+)
 from .claude.tokens import TokenUsageLog
 from .config import (
     NovelProjectConfig,
     StageConfig,
-    deprecation_warnings_for,
     stage_ids_for,
     with_max_chapters,
 )
 from .errors import (
     CheckpointCorrupt,
     ContextOverflow,
-    FundamentIssue,
     NovelForgeError,
     OutputParseError,
     RateLimited,
-    ReviewLoopExceeded,
-    RouteCycleExceeded,
     SchemaInvalid,
-    StageDisabled,
     StateError,
+    StageIncomplete,
+    StageDisabled,
+    VerifyFailed,
     WriteFailure,
 )
-from .review.gate import ReviewGate
-from .stages import GenericStage, Stage, build_stage_registry, build_v4_stage, is_v4_config
+from .stages import build_v4_stage
 from .stages.base import StageContext, StageExecutionResult
 from .state import Checkpoint, State, StateStore
-from .templates import get_template
 from .utils.fs import ensure_dir, sha256_file
-from .utils import count_words
 from .utils.log import get_logger, log_stage_enter, log_stage_exit
 
 log = get_logger("orchestrator")
@@ -113,28 +112,105 @@ class RunSummary:
 
 
 # --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _attempt_state_key(stage_id: str) -> str:
+    return f"stage_attempts.{stage_id}"
+
+
+def _coerce_attempts(
+    raw: Any, *, batch: int
+) -> Union[int, list[int]]:
+    """Coerce a persisted attempts value into the expected form.
+
+    Raises :class:`CheckpointCorrupt` when a batch stage's persisted
+    attempts length doesn't match ``batch`` (plan D14).
+    """
+
+    if batch > 1:
+        if isinstance(raw, list):
+            cleaned = [int(x) if isinstance(x, (int, float)) else 0 for x in raw]
+            if len(cleaned) != batch:
+                raise CheckpointCorrupt(
+                    f"persisted attempts length {len(cleaned)} does not match "
+                    f"batch={batch}; run with --fresh to reset"
+                )
+            return cleaned
+        if raw is None:
+            return [0] * batch
+        # Tolerate a stray int (legacy form) — expand to a list.
+        if isinstance(raw, (int, float)):
+            return [int(raw)] + [0] * (batch - 1)
+        return [0] * batch
+    if isinstance(raw, list):
+        # Tolerate a stray list; fold to int.
+        return int(raw[0]) if raw else 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    return 0
+
+
+def _serialize_registry(registry: ArtifactRegistry, project_root: Path) -> dict[str, Any]:
+    """Return a yaml-friendly ``{stage_id: {alias: path | [paths]}}`` map.
+
+    Paths are stored relative to ``project_root`` so the persisted
+    state is portable across machines.
+    """
+
+    raw = registry.to_dict()
+    out: dict[str, dict[str, Any]] = {}
+    for sid, bucket in raw.items():
+        out[sid] = {}
+        for alias, value in bucket.items():
+            if isinstance(value, list):
+                rels: list[str] = []
+                for p in value:
+                    try:
+                        rels.append(str(Path(p).relative_to(project_root)))
+                    except ValueError:
+                        rels.append(str(p))
+                out[sid][alias] = rels
+            else:
+                try:
+                    out[sid][alias] = str(Path(value).relative_to(project_root))
+                except ValueError:
+                    out[sid][alias] = str(value)
+    return out
+
+
+def _deserialize_registry(raw: Any, project_root: Path) -> ArtifactRegistry:
+    """Inverse of :func:`_serialize_registry`."""
+
+    if not isinstance(raw, Mapping):
+        return ArtifactRegistry()
+    normalised: dict[str, dict[str, Any]] = {}
+    for sid, bucket in raw.items():
+        if not isinstance(bucket, Mapping):
+            continue
+        normalised[sid] = {}
+        for alias, value in bucket.items():
+            if isinstance(value, list):
+                normalised[sid][alias] = [
+                    (project_root / p).resolve() for p in value
+                ]
+            else:
+                normalised[sid][alias] = (project_root / str(value)).resolve()
+    return ArtifactRegistry.from_dict(normalised)
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
 
 
 class Orchestrator:
-    """High-level pipeline driver.
-
-    Parameters
-    ----------
-    config:
-        Validated :class:`NovelProjectConfig`.
-    config_path:
-        Path to the yaml on disk (used to resolve the project root).
-    project_root:
-        Directory containing the project files.
-    use_mock:
-        If True, swap in :class:`MockClaudeAdapter` (handy for tests and
-        offline runs).  Also auto-enabled when ``--use-mock`` is set on
-        the CLI or when the ``NOVELFORGE_MOCK`` env var is truthy.
-    max_chapters_override, skip_polish:
-        Convenience hooks for debugging and small samples.
-    """
+    """High-level pipeline driver (v4 contract model)."""
 
     def __init__(
         self,
@@ -155,13 +231,9 @@ class Orchestrator:
             self.config = with_max_chapters(self.config, max_chapters_override)
         self.skip_polish = skip_polish
         self._use_mock = use_mock
-        # Adapter and gate are constructed lazily so tests can patch
-        # ``_build_adapter`` / ``_build_gate``.
         self._adapter: Optional[ClaudeAdapter] = None
-        self._gate: Optional[ReviewGate] = None
-        self._stages: Optional[dict[str, Stage]] = None
-        self._v4_stage: Optional[GenericStage] = None
-        self._is_v4: bool = is_v4_config(self.config)
+        self._v4_stage = None  # type: ignore[assignment]
+        self._registry: Optional[ArtifactRegistry] = None
 
     # -- factories -----------------------------------------------------
 
@@ -171,36 +243,36 @@ class Orchestrator:
             return MockClaudeAdapter(usage_log=usage_log)
         return ClaudeCLIAdapter(usage_log=usage_log)
 
-    def _build_gate(self) -> ReviewGate:
-        return ReviewGate()
-
-    def _build_stages(self) -> dict[str, Stage]:
-        if self._is_v4:
-            # The v4 path uses a single GenericStage; the registry
-            # exists only so the existing per-id lookup in _drive
-            # stays uniform.
-            return {"_generic_": self._require_v4_stage()}
-        return build_stage_registry(self._require_adapter(), self._require_gate())
-
     def _require_adapter(self) -> ClaudeAdapter:
         if self._adapter is None:
             self._adapter = self._build_adapter()
         return self._adapter
 
-    def _require_gate(self) -> ReviewGate:
-        if self._gate is None:
-            self._gate = self._build_gate()
-        return self._gate
-
-    def _require_stages(self) -> dict[str, Stage]:
-        if self._stages is None:
-            self._stages = self._build_stages()
-        return self._stages
-
-    def _require_v4_stage(self) -> GenericStage:
+    def _require_stage(self):
         if self._v4_stage is None:
             self._v4_stage = build_v4_stage(self._require_adapter())
         return self._v4_stage
+
+    def _require_registry(self) -> ArtifactRegistry:
+        if self._registry is None:
+            # Try to restore from state.extra.artifacts first.
+            existing = self.state.load()
+            raw_artifacts = existing.extra.get("artifacts")
+            if raw_artifacts:
+                try:
+                    self._registry = _deserialize_registry(
+                        raw_artifacts, self.project_root
+                    )
+                except (StateError, TypeError, ValueError) as exc:
+                    log.warning(
+                        "failed to deserialise persisted artifacts (%s); "
+                        "starting with an empty registry",
+                        exc,
+                    )
+                    self._registry = ArtifactRegistry()
+            else:
+                self._registry = ArtifactRegistry()
+        return self._registry
 
     # -- public --------------------------------------------------------
 
@@ -209,24 +281,23 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Execute the pipeline.  Returns a JSON-serializable summary."""
 
-        # Emit deprecation warnings for v3 fields (A1, spec §5.5.1).
-        for msg in deprecation_warnings_for(self.config):
-            log.warning("DeprecationWarning: %s", msg)
-
         self.state.ensure_dirs()
         stages = self._resolve_stages()
         if not stages:
             log.warning("no stages to run; pipeline is empty")
-            return RunSummary(ok=True, status="empty", decision_reason="no_stages").to_dict()
+            return RunSummary(
+                ok=True, status="empty", decision_reason="no_stages"
+            ).to_dict()
 
-        # Clear stale state when running fresh.
+        # Always (re)build the registry from persisted state unless the
+        # user explicitly requested a fresh run.
         if fresh:
             self._clear_state_for_fresh_run()
+            self._registry = ArtifactRegistry()
+        else:
+            self._require_registry()
 
-        # When the user explicitly calls resume (fresh=False), clear the
-        # paused flag so the pipeline can attempt to continue.  Per spec:
-        # "暂停状态可被 resume 命令拉起".  If the underlying issue
-        # persists the pipeline will pause again after retrying.
+        # When the user explicitly calls resume, clear the paused flag.
         if not fresh and not force_stage:
             existing = self.state.load()
             if existing.paused:
@@ -236,9 +307,24 @@ class Orchestrator:
                 )
                 existing.paused = False
                 existing.paused_reason = None
+                # AC-10: a pause ends the previous attempt budget; the
+                # resuming stage starts a fresh ``max_attempts`` round.
+                paused_stage_id = existing.current_stage
+                if paused_stage_id:
+                    attempts_map = dict(existing.extra.get("stage_attempts") or {})
+                    if paused_stage_id in attempts_map:
+                        stage_cfg = self._stage_config_by_id(paused_stage_id)
+                        if stage_cfg is not None and stage_cfg.batch > 1:
+                            attempts_map[paused_stage_id] = [0] * stage_cfg.batch
+                        else:
+                            attempts_map[paused_stage_id] = 0
+                        existing.extra["stage_attempts"] = attempts_map
+                        log.info(
+                            "reset_stage_attempts stage=%s (AC-10 resume)",
+                            paused_stage_id,
+                        )
                 self.state.save(existing)
 
-        # Decide where to start.
         plan = self.state.recovery_plan(
             project_root=self.project_root,
             stages=stages,
@@ -271,7 +357,6 @@ class Orchestrator:
                 decision_reason=plan.reason,
             ).to_dict()
 
-        # If forced, record the decision reason and jump to that stage.
         current_state = self.state.load()
         if plan.forced:
             current_state.forced_stage = plan.forced_stage
@@ -282,26 +367,12 @@ class Orchestrator:
         summary = RunSummary(next_stage=plan.next_stage, decision_reason=plan.reason)
         try:
             self._drive(stages, start_at=plan.next_stage, summary=summary)
-        except FundamentIssue as exc:
-            self._pause_with("FUNDAMENTAL_ISSUE", exc, summary)
-            log.error("pipeline paused: FUNDAMENTAL_ISSUE (%s)", exc)
-        except RouteCycleExceeded as exc:
-            # A8: route loop exceeded -> pause (default on_failure).
-            self._pause_with("RouteCycleExceeded", exc, summary)
-        except RateLimited as exc:
-            self._pause_with("RateLimited", exc, summary)
-        except WriteFailure as exc:
-            self._pause_with("WriteFailure", exc, summary)
-        except ContextOverflow as exc:
-            self._pause_with("ContextOverflow", exc, summary)
-        except SchemaInvalid as exc:
-            self._pause_with("SchemaInvalid", exc, summary)
+        except (RateLimited, WriteFailure, ContextOverflow) as exc:
+            self._pause_with(type(exc).__name__, exc, summary)
+        except (SchemaInvalid, OutputParseError) as exc:
+            self._pause_with(type(exc).__name__, exc, summary)
         except StageDisabled as exc:
-            # A7: route pointed at a disabled stage -> pause.
             self._pause_with("StageDisabled", exc, summary)
-        except OutputParseError as exc:
-            # A11: split regex did not match -> pause (default on_failure).
-            self._pause_with("OutputParseError", exc, summary)
         except CheckpointCorrupt as exc:
             self._pause_with("CheckpointCorrupt", exc, summary)
         except NovelForgeError as exc:
@@ -315,8 +386,6 @@ class Orchestrator:
                 if usage_log is not None:
                     tin, tout = usage_log.total_tokens()
                     summary.total_tokens = tin + tout
-            # On successful completion, clear any leftover paused flag
-            # (e.g. from a prior pause that was overridden via --force-stage).
             if summary.ok:
                 s = self.state.load()
                 if s.paused:
@@ -326,7 +395,7 @@ class Orchestrator:
                     self.state.save(s)
         return summary.to_dict()
 
-    # -- internals -----------------------------------------------------
+    # -- internals: stage iteration -----------------------------------
 
     def _resolve_stages(self) -> list[str]:
         stages = list(stage_ids_for(self.config))
@@ -344,7 +413,6 @@ class Orchestrator:
         if self.state.state_path.exists():
             log.info("fresh run: removing existing state.yaml")
             self.state.state_path.unlink()
-        # Drop checkpoint history too: fresh starts have no checkpoints.
         for cp in self.state.list_checkpoints():
             try:
                 cp.unlink()
@@ -358,30 +426,21 @@ class Orchestrator:
         start_at: str,
         summary: RunSummary,
     ) -> None:
-        registry = self._require_stages()
         if start_at not in stages:
             raise NovelForgeError(f"unknown stage: {start_at!r}")
-        # StageConfig lookup index (used in the v4 path).
         configs_by_id = {s.id: s for s in self.config.pipeline.stages}
-        # Per-stage review iteration counters, persisted in state.extra so
-        # that resumes don't reset the count.
-        persisted = self.state.load()
-        review_iters: dict[str, int] = dict(
-            persisted.extra.get("review_iterations", {}) or {}
-        )
-        route_history: list[dict[str, Any]] = list(
-            persisted.extra.get("route_history", []) or []
-        )
+        registry = self._require_registry()
+        stage_exec = self._require_stage()
 
         cursor = stages.index(start_at)
-        max_iter = self.config.execution.max_review_iterations
-
         while cursor < len(stages):
             stage_id = stages[cursor]
             stage_config = configs_by_id.get(stage_id)
-
-            # A4: enabled=false stages are skipped wholesale.
-            if stage_config is not None and not stage_config.enabled:
+            if stage_config is None:
+                raise NovelForgeError(
+                    f"no StageConfig for stage {stage_id!r}"
+                )
+            if not stage_config.enabled:
                 log.info(
                     "stage_skipped stage=%s reason=enabled_false",
                     stage_id,
@@ -390,291 +449,289 @@ class Orchestrator:
                 cursor += 1
                 continue
 
-            # Track loop iterations for review-style stages (A8).
-            iter_count = 0
-            if stage_id.startswith("review_") or (
-                stage_config is not None
-                and stage_config.output.endswith(".json")
-            ):
-                review_iters[stage_id] = review_iters.get(stage_id, 0) + 1
-                iter_count = review_iters[stage_id]
-                if iter_count > max_iter:
-                    msg = (
-                        f"RouteCycleExceeded stage={stage_id} "
-                        f"iterations={iter_count} max={max_iter}; "
-                        f"applying on_failure"
-                    )
-                    log.warning(msg)
-                    route_history.append(
-                        {
-                            "stage": stage_id,
-                            "iteration": iter_count,
-                            "outcome": "cycle_exceeded",
-                        }
-                    )
-                    self._checkpoint_current(
-                        stage_id=stage_id,
-                        batch=self._batch_for(stage_id),
-                        files=[],
-                        stage_result=None,
-                    )
-                    self._mark_state(
-                        current_stage=stages[cursor + 1]
-                        if cursor + 1 < len(stages)
-                        else None,
-                        last_review_iterations=iter_count,
-                        review_loop_warning=True,
-                        review_loop_stage=stage_id,
-                        review_iterations=review_iters,
-                        route_history=route_history,
-                    )
-                    if self._is_v4:
-                        # v4 spec A8: apply on_failure (default pause).
-                        self._apply_on_failure(
-                            stage_id=stage_id,
-                            reason=f"loop exceeded ({iter_count} > {max_iter})",
-                            summary=None,
-                        )
-                    # v3 backward compat: accept the current version
-                    # and move on.  The original orchestrator logged a
-                    # warning + checkpoint and advanced.
-                    cursor += 1
-                    continue
-
             log_stage_enter(stage_id)
             t0 = time.monotonic()
             try:
-                result = self._execute_with_retry(
-                    registry=registry,
-                    stage_id=stage_id,
-                    stage_config=stage_config,
-                )
-            except FundamentIssue:
-                raise
-            duration = time.monotonic() - t0
-
-            route = result.route
-            # v3: FUNDAMENTAL_ISSUE halt path
-            if route == "FUNDAMENTAL_ISSUE":
-                self._checkpoint_current(
-                    stage_id=stage_id,
-                    batch=result.batch or "001",
-                    files=result.files,
-                    stage_result=result,
-                )
-                self._mark_state(
-                    current_stage=stage_id,
-                    last_review_iterations=iter_count,
-                    review_iterations=review_iters,
-                    route_history=route_history,
-                )
-                raise FundamentIssue(
-                    f"review stage {stage_id} returned FUNDAMENTAL_ISSUE: "
-                    f"{result.findings[:3]}"
-                )
-
-            # Persist checkpoint for this stage.
-            self._checkpoint_current(
-                stage_id=stage_id,
-                batch=result.batch or "001",
-                files=result.files,
-                stage_result=result,
-            )
-            self._mark_state(
-                current_stage=stages[cursor + 1] if cursor + 1 < len(stages) else None,
-                last_review_iterations=(
-                    iter_count
-                    if (stage_id.startswith("review_") or
-                        (stage_config and stage_config.output.endswith(".json")))
-                    else None
-                ),
-                review_iterations=review_iters,
-                route_history=route_history,
-            )
-            # Reset the loop counter only when the review actually
-            # passed (APPROVED / DONE / no route).  NEEDS_REWRITE and
-            # v4-style jumps keep the counter so the cycle ceiling
-            # can fire.
-            if (stage_id.startswith("review_") or (
-                stage_config and stage_config.output.endswith(".json")
-            )) and route in (None, "", "APPROVED", "DONE", "SKIPPED"):
-                review_iters[stage_id] = 0
-            log_stage_exit(stage_id, route=route, duration=duration)
-            summary.stages_run += 1
-            if stage_id == "write_chapter":
-                written = self._chapter_files(self.project_root)
-                summary.chapters_written = len(written)
-
-            # Decide the next cursor via the v4 routing rules.
-            next_cursor = self._next_cursor(
-                stages=stages,
-                cursor=cursor,
-                stage_id=stage_id,
-                route=route,
-                result=result,
-                review_iters=review_iters,
-                max_iter=max_iter,
-                route_history=route_history,
-            )
-            if next_cursor is None:
-                # on_failure disposition triggered pause.
+                self._drive_stage(stage_config, stage_exec, registry, summary)
+            except _OnFailureApplied:
+                # The stage exhausted its retries and the configured
+                # ``on_failure`` disposition was pause / fail.  Exit.
                 return
-            cursor = next_cursor
+            duration = time.monotonic() - t0
+            log_stage_exit(stage_id, route="ok", duration=duration)
+            summary.stages_run += 1
+            self._mark_state(current_stage=stages[cursor + 1] if cursor + 1 < len(stages) else None)
+            cursor += 1
 
         summary.ok = True
         summary.status = "complete"
 
-    # -- v4 routing ----------------------------------------------------
+    # -- per-stage driving --------------------------------------------
 
-    def _next_cursor(
+    def _drive_stage(
         self,
-        *,
-        stages: list[str],
-        cursor: int,
-        stage_id: str,
-        route: str,
-        result: StageExecutionResult,
-        review_iters: dict[str, int],
-        max_iter: int,
-        route_history: list[dict[str, Any]],
-    ) -> Optional[int]:
-        """Decide which cursor to advance to after a stage completes.
+        stage: StageConfig,
+        stage_exec,
+        registry: ArtifactRegistry,
+        summary: RunSummary,
+    ) -> None:
+        """Drive a single stage end-to-end (batch items included)."""
 
-        Returns ``None`` to signal that the current stage's
-        ``on_failure`` has triggered a pause that the orchestrator
-        must surface via ``_pause_with``.
+        if stage.batch > 1:
+            self._drive_batch(stage, stage_exec, registry, summary)
+        else:
+            self._drive_single(stage, stage_exec, registry, summary)
 
-        Rules (spec §5.2 + v3 backward compat):
+    def _drive_single(
+        self,
+        stage: StageConfig,
+        stage_exec,
+        registry: ArtifactRegistry,
+        summary: RunSummary,
+    ) -> None:
+        """Drive a non-batch stage through the dual-layer retry matrix."""
 
-        1. JSON stage with a ``route`` value that matches an enabled
-           stage id → jump there.
-        2. v3 backward-compat: ``route`` in {``NEEDS_REWRITE``,
-           ``FUNDAMENTAL_ISSUE``, ``APPROVED``} → use the v3
-           semantic (rewind / halt / natural next).
-        3. JSON stage with a ``route`` value that doesn't match any
-           known enabled id → on_failure (default pause).
-        4. JSON stage without a ``route`` field → natural next.
-        5. Text / split stages → natural next (A6).
-        """
-
-        # Only JSON outputs can carry a route.  Text / split stages
-        # always advance.
-        target = self._stage_config_by_id(stage_id)
-        is_json = target is not None and target.output.endswith(".json")
-        if not is_json:
-            return cursor + 1
-        # Missing / APPROVED / DONE / SKIPPED → natural next.
-        if route in (None, "", "APPROVED", "DONE", "SKIPPED"):
-            return cursor + 1
-        # ---- v3 backward compat ----
-        if route == "NEEDS_REWRITE":
-            target_idx = self._rewind_to(stages, cursor)
-            if target_idx is not None:
-                return target_idx
-            return cursor + 1
-        if route == "FUNDAMENTAL_ISSUE":
-            # Caller already raised FundamentIssue earlier; defensively
-            # advance if it slipped through.
-            return cursor + 1
-        # ---- v4 path: treat route as a stage id ----
-        if route not in stages:
-            log.warning(
-                "route_invalid stage=%s route=%s valid=%s",
-                stage_id, route, stages,
-            )
-            self._apply_on_failure(
-                stage_id=stage_id, reason=f"route '{route}' unknown", summary=None
-            )
-            return None
-        target_cfg = self._stage_config_by_id(route)
-        if target_cfg is not None and not target_cfg.enabled:
-            log.warning(
-                "route_target_disabled stage=%s route=%s",
-                stage_id, route,
-            )
-            # Count the attempt in history (still) so the loop ceiling
-            # cannot be bypassed by pointing at a disabled stage.
-            review_iters[stage_id] = review_iters.get(stage_id, 0) + 1
-            iter_count = review_iters[stage_id]
-            if iter_count > max_iter:
-                msg = (
-                    f"RouteCycleExceeded stage={stage_id} "
-                    f"iterations={iter_count} max={max_iter}; "
-                    f"target '{route}' is disabled"
+        attempts = self._load_attempts(stage, item=None)
+        while True:
+            attempt = attempts + 1
+            try:
+                result = self._execute_with_retry(
+                    stage_exec=stage_exec,
+                    stage=stage,
+                    registry=registry,
+                    batch="001",
+                    attempt=attempt,
+                    last_failure=self._last_failure_for(stage.id),
                 )
-                log.warning(msg)
-                route_history.append(
-                    {
-                        "stage": stage_id,
-                        "iteration": iter_count,
-                        "outcome": "cycle_exceeded_disabled_target",
-                        "target": route,
-                    }
+            except (StageIncomplete, VerifyFailed) as exc:
+                attempts += 1
+                self._persist_attempts(stage, attempts, item=None)
+                self._record_last_failure(stage.id, exc)
+                if attempts >= stage.done_when.max_attempts:
+                    skipped = self._apply_on_failure(
+                        stage_id=stage.id,
+                        reason=f"max_attempts={stage.done_when.max_attempts} "
+                        f"exhausted ({type(exc).__name__})",
+                        summary=summary,
+                    )
+                    if skipped:
+                        # on_failure: skip → advance to the next stage.
+                        return
+                    raise _OnFailureApplied()
+                wait = self._backoff_seconds(
+                    self.config.execution.retry.backoff,
+                    attempts - 1,
+                    self.config.execution.retry.max_wait,
                 )
-                raise RouteCycleExceeded(msg)
-            # A17: record the disabled-target attempt so the user can
-            # see how many times the misconfigured route fired before
-            # the threshold tripped.
-            route_history.append(
-                {
-                    "stage": stage_id,
-                    "target": route,
-                    "iteration": iter_count,
-                    "outcome": "target_disabled",
-                }
-            )
-            # Apply the source stage's on_failure disposition.  ``skip``
-            # re-executes the source (the loop continues until the
-            # iter check above trips); ``pause``/``fail`` raise so the
-            # orchestrator surfaces the run state.
-            src_cfg = self._stage_config_by_id(stage_id)
-            disposition = src_cfg.on_failure if src_cfg is not None else "pause"
-            log.warning(
-                "on_failure_triggered stage=%s disposition=%s reason=%s",
-                stage_id,
-                disposition,
-                f"route '{route}' points to disabled stage",
-            )
-            if disposition == "skip":
-                # Re-execute the source stage on the next loop pass.
-                return cursor
-            if disposition == "fail":
-                raise NovelForgeError(
-                    f"Fail: route '{route}' points to disabled stage"
+                log.warning(
+                    "stage=%s attempt=%d failed (%s); retrying after %.1fs",
+                    stage.id, attempts, exc, wait,
                 )
-            # pause (default)
-            raise NovelForgeError(
-                f"pause: route '{route}' points to disabled stage"
+                time.sleep(wait)
+                continue
+            # Success — checkpoint, register, advance.
+            self._checkpoint_current(
+                stage_id=stage.id,
+                batch="001",
+                files=result.files,
+                stage_result=result,
             )
-        # Valid jump.
-        log.info("route_jump stage=%s → %s", stage_id, route)
-        route_history.append(
-            {
-                "stage": stage_id,
-                "target": route,
-                "iteration": review_iters.get(stage_id, 0),
-            }
-        )
-        return stages.index(route)
+            self._clear_last_failure(stage.id)
+            self._persist_attempts(stage, 0, item=None)
+            return
+
+    def _drive_batch(
+        self,
+        stage: StageConfig,
+        stage_exec,
+        registry: ArtifactRegistry,
+        summary: RunSummary,
+    ) -> None:
+        """Drive a ``batch: N`` stage item by item (plan D14)."""
+
+        n = stage.batch
+        attempts_list = self._load_attempts(stage, item=None)
+        if not isinstance(attempts_list, list):
+            attempts_list = [0] * n
+        if len(attempts_list) != n:
+            raise CheckpointCorrupt(
+                f"stage {stage.id!r}: persisted attempts length "
+                f"{len(attempts_list)} does not match batch={n}; "
+                f"run with --fresh to reset"
+            )
+
+        # Per-alias accumulator so multi-produce batch stages register
+        # each alias as its own length-N list (AC-7).  Single-produce
+        # batch stages collapse to the same flat list as before.
+        per_alias_paths: dict[str, list[Path]] = {
+            p.alias: [] for p in stage.produces
+        }
+        successful_paths: list[Path] = []
+        for idx in range(1, n + 1):
+            batch_label = f"{idx:03d}"
+            item_attempts = attempts_list[idx - 1]
+            while True:
+                attempt = item_attempts + 1
+                try:
+                    result = self._execute_with_retry(
+                        stage_exec=stage_exec,
+                        stage=stage,
+                        registry=registry,
+                        batch=batch_label,
+                        attempt=attempt,
+                        last_failure=self._last_failure_for(
+                            f"{stage.id}.{batch_label}"
+                        ),
+                    )
+                except (StageIncomplete, VerifyFailed) as exc:
+                    item_attempts += 1
+                    attempts_list[idx - 1] = item_attempts
+                    self._persist_attempts(stage, attempts_list, item=None)
+                    self._record_last_failure(
+                        f"{stage.id}.{batch_label}", exc
+                    )
+                    if item_attempts >= stage.done_when.max_attempts:
+                        log.warning(
+                            "batch_item_exhausted stage=%s item=%s attempts=%d",
+                            stage.id, batch_label, item_attempts,
+                        )
+                        # Per D14: prior successful items stay
+                        # registered; remaining items do not run; the
+                        # stage as a whole walks on_failure.
+                        skipped = self._apply_on_failure(
+                            stage_id=stage.id,
+                            reason=f"batch item {batch_label} exhausted "
+                            f"max_attempts={stage.done_when.max_attempts} "
+                            f"({type(exc).__name__})",
+                            summary=summary,
+                        )
+                        # Persist whatever items succeeded before bailing.
+                        if successful_paths:
+                            self._register_batch_paths(
+                                stage, registry, per_alias_paths
+                            )
+                        if skipped:
+                            return
+                        raise _OnFailureApplied()
+                    wait = self._backoff_seconds(
+                        self.config.execution.retry.backoff,
+                        item_attempts - 1,
+                        self.config.execution.retry.max_wait,
+                    )
+                    log.warning(
+                        "batch_retry stage=%s item=%s attempt=%d (%s); sleeping %.1fs",
+                        stage.id, batch_label, item_attempts, exc, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                # Item succeeded — record its files and move on.
+                successful_paths.extend(result.files)
+                item_paths = result.extras.get("produces_paths") or {}
+                for alias, paths in item_paths.items():
+                    if alias in per_alias_paths:
+                        per_alias_paths[alias].extend(paths)
+                self._checkpoint_current(
+                    stage_id=stage.id,
+                    batch=batch_label,
+                    files=result.files,
+                    stage_result=result,
+                )
+                self._clear_last_failure(f"{stage.id}.{batch_label}")
+                attempts_list[idx - 1] = 0
+                self._persist_attempts(stage, attempts_list, item=None)
+                break
+
+        # Register each alias as its own length-N list (AC-7).  Note
+        # that GenericStage already registers each individual produce
+        # when the call succeeds; the explicit re-register here keeps
+        # the data flow consistent for downstream ``{{upstream.*[*]}}``.
+        if successful_paths:
+            self._register_batch_paths(stage, registry, per_alias_paths)
 
     @staticmethod
-    def _rewind_to(stages: list[str], cursor: int) -> Optional[int]:
-        """v3 backward-compat: rewind to the content stage being reviewed.
+    def _register_batch_paths(
+        stage: StageConfig,
+        registry: ArtifactRegistry,
+        per_alias_paths: Mapping[str, Sequence[Path]],
+    ) -> None:
+        """Persist batch produces as a list[Path] under each alias.
 
-        For a stage id ``review_X``, return the index of stage ``X``;
-        if missing, the immediately preceding stage; if there is
-        none, return None.
+        ``GenericStage._register_produces`` already registers the
+        per-item single path on success; we override it here so each
+        alias holds the complete length-N list expected by downstream
+        ``{{upstream.<id>.<alias>[*]}}`` references.
         """
 
-        review = stages[cursor]
-        if not review.startswith("review_"):
-            return None
-        content_id = review[len("review_"):]
-        if content_id in stages:
-            return stages.index(content_id)
-        if cursor > 0:
-            return cursor - 1
-        return None
+        for produce in stage.produces:
+            paths = per_alias_paths.get(produce.alias) or []
+            if not paths:
+                continue
+            registry.register(stage.id, produce.alias, list(paths))
+
+    # -- retry / backoff ----------------------------------------------
+
+    def _execute_with_retry(
+        self,
+        *,
+        stage_exec,
+        stage: StageConfig,
+        registry: ArtifactRegistry,
+        batch: str,
+        attempt: int,
+        last_failure: Optional[Mapping[str, Any]],
+    ) -> StageExecutionResult:
+        """Inner A-tier retry loop.
+
+        Catches ``RateLimited`` / ``WriteFailure`` / ``ContextOverflow``
+        (infrastructure errors) up to ``execution.retry.max_retries``
+        with backoff; lets C-tier errors (``StageIncomplete`` /
+        ``VerifyFailed``) propagate to :meth:`_drive_single` /
+        :meth:`_drive_batch`.
+        """
+
+        retry = self.config.execution.retry
+        attempts = 0
+        last_exc: Optional[Exception] = None
+        while True:
+            try:
+                ctx = StageContext(
+                    config=self.config,
+                    project_root=self.project_root,
+                    stage_id=stage.id,
+                    batch=batch,
+                    extras={
+                        "stage_config": stage,
+                        "registry": registry,
+                        "attempt": attempt,
+                        "last_failure": dict(last_failure) if last_failure else None,
+                    },
+                )
+                return stage_exec.execute(ctx)
+            except (RateLimited, WriteFailure, ContextOverflow) as exc:
+                last_exc = exc
+                if attempts >= retry.max_retries:
+                    raise
+                wait = self._backoff_seconds(
+                    retry.backoff, attempts, retry.max_wait
+                )
+                log.warning(
+                    "stage=%s batch=%s A-tier attempt=%d failed (%s); sleeping %.1fs",
+                    stage.id, batch, attempts + 1, exc, wait,
+                )
+                time.sleep(wait)
+                attempts += 1
+
+    @staticmethod
+    def _backoff_seconds(strategy: str, attempt: int, max_wait: int) -> float:
+        if strategy == "exponential":
+            wait = min(max_wait, 2 ** max(0, attempt))
+        elif strategy == "linear":
+            wait = min(max_wait, attempt + 1)
+        else:
+            wait = 1.0
+        return float(wait)
+
+    # -- on_failure disposition --------------------------------------
 
     def _apply_on_failure(
         self,
@@ -682,13 +739,12 @@ class Orchestrator:
         stage_id: str,
         reason: str,
         summary: Optional[RunSummary],
-    ) -> None:
+    ) -> bool:
         """Apply the current stage's ``on_failure`` disposition.
 
-        Mirrors the v3 behaviour: ``pause`` is the default; ``skip``
-        advances to the next stage; ``fail`` pauses with reason
-        prefixed ``Fail:``.  Pauses set ``summary.paused = True`` so
-        the CLI exit code is 3.
+        Returns ``True`` for ``skip`` (caller should advance to the
+        next stage), ``False`` for ``pause`` / ``fail`` (caller should
+        propagate the surfaced exception).
         """
 
         target = self._stage_config_by_id(stage_id)
@@ -698,90 +754,75 @@ class Orchestrator:
             stage_id, disposition, reason,
         )
         if disposition == "skip":
-            return
+            return True
         if disposition == "fail":
             raise NovelForgeError(f"Fail: {reason}")
         # pause (default)
         raise NovelForgeError(f"pause: {reason}")
 
-    def _execute_with_retry(
+    # -- state persistence --------------------------------------------
+
+    def _load_attempts(
         self,
+        stage: StageConfig,
         *,
-        registry: dict[str, Stage],
-        stage_id: str,
-        stage_config: Optional[StageConfig],
-    ) -> StageExecutionResult:
-        """Invoke the stage with retry/backoff on retryable errors.
+        item: Optional[int],
+    ) -> Union[int, list[int]]:
+        """Load persisted attempts for ``stage`` from ``state.extra``."""
 
-        Errors that are NOT retried (caller handles):
+        s = self.state.load()
+        raw_attempts = (s.extra.get("stage_attempts") or {}).get(stage.id)
+        return _coerce_attempts(raw_attempts, batch=stage.batch)
 
-        - ``FundamentIssue`` (review veto)
-        - ``SchemaInvalid`` (model misbehaviour)
-        - ``CheckpointCorrupt`` (state is broken)
-        - ``OutputParseError`` (A11 — split did not match)
-        - ``RouteCycleExceeded`` (A8)
-        - ``StageDisabled`` (A7)
-        """
+    def _persist_attempts(
+        self,
+        stage: StageConfig,
+        value: Union[int, list[int]],
+        *,
+        item: Optional[int],
+    ) -> None:
+        s = self.state.load()
+        attempts_map = dict(s.extra.get("stage_attempts") or {})
+        attempts_map[stage.id] = value
+        s.extra["stage_attempts"] = attempts_map
+        # Persist the registry too so resumes see consistent produces.
+        registry = self._require_registry()
+        s.extra["artifacts"] = _serialize_registry(registry, self.project_root)
+        self.state.save(s)
 
-        retry = self.config.execution.retry
-        attempts = 0
-        last_exc: Optional[Exception] = None
-        stage = registry.get(stage_id) or registry.get("_generic_")
-        if stage is None:
-            raise NovelForgeError(f"unknown stage: {stage_id!r}")
-        while attempts <= retry.max_retries:
-            try:
-                ctx = StageContext(
-                    config=self.config,
-                    project_root=self.project_root,
-                    stage_id=stage_id,
-                    batch=self._batch_for(stage_id),
-                    extras={"stage_config": stage_config} if stage_config is not None else {},
-                )
-                return stage.execute(ctx)
-            except (RateLimited, WriteFailure, ContextOverflow) as exc:
-                last_exc = exc
-                if attempts >= retry.max_retries:
-                    break
-                wait = self._backoff_seconds(retry.backoff, attempts, retry.max_wait)
-                log.warning(
-                    "stage=%s attempt=%d failed (%s); sleeping %.1fs before retry",
-                    stage_id,
-                    attempts + 1,
-                    exc,
-                    wait,
-                )
-                time.sleep(wait)
-                attempts += 1
-        assert last_exc is not None
-        raise last_exc
+    def _last_failure_for(self, key: str) -> Optional[Mapping[str, Any]]:
+        s = self.state.load()
+        bucket = s.extra.get("last_failures") or {}
+        return bucket.get(key)
 
-    @staticmethod
-    def _backoff_seconds(strategy: str, attempt: int, max_wait: int) -> float:
-        if strategy == "exponential":
-            wait = min(max_wait, 2 ** attempt)
-        elif strategy == "linear":
-            wait = min(max_wait, attempt + 1)
-        else:
-            wait = 1.0
-        return float(wait)
+    def _record_last_failure(self, key: str, exc: BaseException) -> None:
+        s = self.state.load()
+        bucket = dict(s.extra.get("last_failures") or {})
+        detail: Any = getattr(exc, "detail", None) if hasattr(exc, "detail") else None
+        bucket[key] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "detail": dict(detail) if isinstance(detail, Mapping) else (str(detail) if detail is not None else ""),
+        }
+        s.extra["last_failures"] = bucket
+        self.state.save(s)
 
-    def _batch_for(self, stage_id: str) -> str:
-        if stage_id == "write_chapter":
-            n = self._next_chapter_index(self.project_root)
-            return f"{n:03d}"
-        return "001"
+    def _clear_last_failure(self, key: str) -> None:
+        s = self.state.load()
+        bucket = dict(s.extra.get("last_failures") or {})
+        if key in bucket:
+            del bucket[key]
+            s.extra["last_failures"] = bucket
+            self.state.save(s)
 
     def _checkpoint_current(
         self,
         *,
         stage_id: str,
         batch: str,
-        files: list[Path],
+        files: Sequence[Path],
         stage_result: Optional[StageExecutionResult],
     ) -> None:
-        """Record a checkpoint file with file hashes."""
-
         file_entries: list[dict[str, str]] = []
         for path in files:
             if not path.exists():
@@ -801,7 +842,7 @@ class Orchestrator:
             stage=stage_id,
             batch=batch,
             files=file_entries,
-            timestamp=datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            timestamp=_now_iso(),
             extras={
                 "token_usage": {
                     "input": stage_result.token_usage_in if stage_result else 0,
@@ -811,102 +852,19 @@ class Orchestrator:
         )
         self.state.write_checkpoint(cp)
 
-    def _mark_state(
-        self,
-        *,
-        current_stage: Optional[str],
-        last_review_iterations: Optional[int],
-        review_loop_warning: bool = False,
-        review_loop_stage: Optional[str] = None,
-        review_iterations: Optional[dict[str, int]] = None,
-        route_history: Optional[list[dict[str, Any]]] = None,
-    ) -> None:
+    def _mark_state(self, *, current_stage: Optional[str]) -> None:
         s = self.state.load()
         s.current_stage = current_stage
-        # ``None`` means "don't touch this field" — used by non-review
-        # stages so the value reflects the most recent review loop
-        # instead of being clobbered to 0.
-        if last_review_iterations is not None:
-            s.last_review_iterations = last_review_iterations
-        s.last_checkpoint_at = datetime.now(timezone.utc).astimezone().isoformat(
-            timespec="seconds"
-        )
-        # token usage sum
+        s.last_checkpoint_at = _now_iso()
         usage_log = self.state.logs_dir / "token-usage.log"
         if usage_log.exists():
             tin, tout = TokenUsageLog(usage_log).total_tokens()
             s.token_usage["total_input"] = tin
             s.token_usage["total_output"] = tout
-        # chapter progress
-        s.progress["chapters_written"] = len(
-            list((self.project_root / "output" / "chapters").glob("*.md"))
-        )
-        s.progress["chapters_reviewed"] = self._count_reviewed(self.project_root)
-        s.progress["total_words"] = self._total_words(self.project_root)
-        if stage_progress_key := self._stage_progress_key(current_stage):
-            s.progress[stage_progress_key] = "complete"
-        if review_iterations is not None:
-            s.extra["review_iterations"] = dict(review_iterations)
-        if route_history is not None:
-            # Truncate the persisted history to the configured maximum
-            # so it doesn't grow unbounded over long runs (A8 / §6).
-            limit = self.config.execution.route_history_max
-            trimmed = route_history[-limit:] if len(route_history) > limit else list(route_history)
-            s.extra["route_history"] = trimmed
-        if review_loop_warning:
-            s.extra.setdefault("review_loop_warnings", []).append(
-                {
-                    "stage": review_loop_stage or current_stage,
-                    "iterations": last_review_iterations or 0,
-                    "timestamp": s.last_checkpoint_at,
-                }
-            )
+        # Persist the registry alongside the state save.
+        registry = self._require_registry()
+        s.extra["artifacts"] = _serialize_registry(registry, self.project_root)
         self.state.save(s)
-
-    @staticmethod
-    def _stage_progress_key(stage_id: Optional[str]) -> Optional[str]:
-        return {
-            "generate_outline": "outline",
-            "review_outline": "outline",
-            "design_characters": "characters",
-            "review_characters": "characters",
-            "simulate_plot": "simulation",
-            "review_simulation": "simulation",
-        }.get(stage_id or "")
-
-    @staticmethod
-    def _chapter_files(project_root: Path) -> list[Path]:
-        chap_dir = project_root / "output" / "chapters"
-        if not chap_dir.exists():
-            return []
-        return sorted(chap_dir.glob("*.md"))
-
-    @staticmethod
-    def _next_chapter_index(project_root: Path) -> int:
-        import re
-        nums: list[int] = []
-        for p in (project_root / "output" / "chapters").glob("*.md"):
-            m = re.match(r"^(\d{3,})", p.name)
-            if m:
-                nums.append(int(m.group(1)))
-        return (max(nums) + 1) if nums else 1
-
-    @staticmethod
-    def _count_reviewed(project_root: Path) -> int:
-        review_dir = project_root / "output" / "review"
-        if not review_dir.exists():
-            return 0
-        return sum(1 for _ in review_dir.glob("*-review.json"))
-
-    @staticmethod
-    def _total_words(project_root: Path) -> int:
-        total = 0
-        chap_dir = project_root / "output" / "chapters"
-        if not chap_dir.exists():
-            return 0
-        for p in chap_dir.glob("*.md"):
-            total += count_words(p.read_text(encoding="utf-8", errors="ignore"))
-        return total
 
     def _pause_with(
         self, reason: str, exc: BaseException, summary: RunSummary
@@ -916,9 +874,15 @@ class Orchestrator:
         s.paused = True
         s.paused_reason = reason
         s.current_stage = s.current_stage or summary.next_stage
-        s.last_checkpoint_at = datetime.now(timezone.utc).astimezone().isoformat(
-            timespec="seconds"
-        )
+        s.last_checkpoint_at = _now_iso()
+        # Persist the registry so the resume sees the same data flow.
+        try:
+            registry = self._require_registry()
+            s.extra["artifacts"] = _serialize_registry(
+                registry, self.project_root
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
         self.state.save(s)
         summary.paused = True
         summary.paused_reason = reason
@@ -927,5 +891,16 @@ class Orchestrator:
     def _record_decision_reason(self, reason: str) -> None:
         s = self.state.load()
         s.recovery["last_decision_reason"] = reason
-        s.recovery["last_batch_status"] = "resuming" if reason.startswith("resuming") else reason
+        s.recovery["last_batch_status"] = (
+            "resuming" if reason.startswith("resuming") else reason
+        )
         self.state.save(s)
+
+
+class _OnFailureApplied(Exception):
+    """Sentinel raised internally to short-circuit the stage driving loop
+    after ``on_failure`` has been applied (pause / fail).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("on_failure applied; stopping stage driving")

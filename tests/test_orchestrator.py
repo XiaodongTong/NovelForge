@@ -1,483 +1,529 @@
-"""M5 tests: orchestrator FSM, run / resume / pause behaviour."""
+"""Tests for the v4 contract Orchestrator (Phase 3.5).
+
+Covers the dual-layer retry matrix, batch driving, state persistence,
+and the deletion of v3 route branches per spec §AC-1..AC-3 / plan D14.
+"""
 
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 import pytest
 import yaml
 
-from novelforge.claude.adapter import MockClaudeAdapter, MockResponse
-from novelforge.config import load_config
-from novelforge.errors import FundamentIssue, SchemaInvalid
-from novelforge.orchestrator import Orchestrator
-from novelforge.review.gate import ReviewGate
-from novelforge.state import StateStore
+from novelforge.config import (
+    DoneWhenSpec,
+    ProduceSpec,
+    StageConfig,
+    load_config,
+)
+from novelforge.errors import StageIncomplete, VerifyFailed
+from novelforge.orchestrator import Orchestrator, RunSummary
 
 
 # --------------------------------------------------------------------------- #
-# Fixtures
+# Helpers / fixtures
 # --------------------------------------------------------------------------- #
+
+
+def _write_yaml(project_root: Path, body: str) -> Path:
+    cfg_path = project_root / "novel-project.yaml"
+    cfg_path.write_text(body, encoding="utf-8")
+    return cfg_path
 
 
 @pytest.fixture()
 def project_root(tmp_path: Path) -> Path:
     (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text(
-        "## Premise\n\nA young cultivator.\n", encoding="utf-8"
-    )
-    (tmp_path / "outline" / "world.md").write_text(
-        "## World\n\nThree realms.\n", encoding="utf-8"
-    )
-    (tmp_path / "CLAUDE.md").write_text("# Rules\n", encoding="utf-8")
+    (tmp_path / "outline" / "premise.md").write_text("# Premise\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("# Style\n", encoding="utf-8")
     return tmp_path
 
 
-def _write_yaml(project_root: Path) -> Path:
-    body = """
+SINGLE_STAGE_YAML = """
 novel:
-  title: "Test"
-  genre: "x"
+  title: T
+  genre: T
   target_chapters: 1
-  words_per_chapter: [200, 400]
-  style: "test"
-  seeds: [outline/premise.md, outline/world.md]
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
   constraints: [CLAUDE.md]
 pipeline:
-  template: "long-epic"
-  stages_override:
-    - generate_outline
-    - review_outline
-    - design_characters
-    - write_chapter
-    - review_chapter
+  stages:
+    - id: write
+      model: m
+      prompt: Write the section.
+      produces:
+        - path: output/out.md
+          alias: out
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: output/out.md
+            value: 5
 execution:
-  batch_size: { outline: 5, chapter: 1 }
-  max_review_iterations: 2
-  retry: { max_retries: 1, backoff: "exponential", max_wait: 1 }
+  retry:
+    backoff: constant
+    max_wait: 1
 """
-    path = project_root / "novel-project.yaml"
-    path.write_text(body, encoding="utf-8")
-    return path
+
+TWO_STAGE_YAML = """
+novel:
+  title: T
+  genre: T
+  target_chapters: 1
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
+  constraints: [CLAUDE.md]
+pipeline:
+  stages:
+    - id: generate
+      model: m
+      prompt: Generate.
+      produces:
+        - path: output/gen.md
+          alias: gen
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: output/gen.md
+            value: 5
+    - id: review
+      model: m
+      prompt: Review the upstream {{upstream.generate.gen}}.
+      consumes: [generate]
+      produces:
+        - path: output/review.md
+          alias: review
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: output/review.md
+            value: 5
+execution:
+  retry:
+    backoff: constant
+    max_wait: 1
+"""
 
 
-def _approved_review(stage: str) -> MockResponse:
-    return MockResponse(
-        output=json.dumps(
-            {
-                "passed": True,
-                "route": "APPROVED",
-                "findings": [],
-                "required_changes": [],
-                "summary": "looks good",
-            }
-        ),
-        parsed={
-            "passed": True,
-            "route": "APPROVED",
-            "findings": [],
-            "required_changes": [],
-        },
-    )
-
-
-def _outline_response() -> MockResponse:
-    body = (
-        "## Plot\n\nA hero rises.\n\n"
-        "## Chapter 1 - The Summons\nA knock at the door.\n"
-    )
-    return MockResponse(output=body, input_tokens=10, output_tokens=20)
-
-
-def _characters_response() -> MockResponse:
-    return MockResponse(
-        output=(
-            "# Aria\nA young cultivator.\n\n# Master Hsu\n"
-            "A cynical mentor."
-        ),
-        input_tokens=10,
-        output_tokens=20,
-    )
-
-
-def _chapter_response() -> MockResponse:
-    body = (
-        "# Chapter 1 - The Summons\n\n"
-        "It was a stormy night in the lower realm. " * 20
-    )
-    return MockResponse(output=body, input_tokens=10, output_tokens=200)
-
-
-def _orchestrator(project_root: Path, use_mock: bool = True) -> Orchestrator:
-    cfg_path = _write_yaml(project_root)
+def _run(tmp_path: Path, yaml_body: str, *, mock_env: dict[str, str] | None = None) -> tuple[Orchestrator, dict[str, Any]]:
+    cfg_path = _write_yaml(tmp_path, yaml_body)
     cfg = load_config(cfg_path)
-    return Orchestrator(
+    orch = Orchestrator(
         config=cfg,
         config_path=cfg_path,
-        project_root=project_root,
-        use_mock=use_mock,
-        skip_polish=True,
+        project_root=tmp_path,
+        use_mock=True,
     )
+    # Apply env switches around the run.
+    saved: dict[str, str] = {}
+    if mock_env:
+        for k, v in mock_env.items():
+            saved[k] = os.environ.get(k, "")
+            os.environ[k] = v
+    try:
+        summary = orch.run(fresh=True)
+    finally:
+        if mock_env:
+            for k, orig in saved.items():
+                if orig == "" and k not in os.environ:
+                    continue
+                if orig == "":
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = orig
+    return orch, summary
 
 
 # --------------------------------------------------------------------------- #
-# Happy path
+# Happy paths
 # --------------------------------------------------------------------------- #
 
 
-def test_run_writes_state_and_checkpoints(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock: MockClaudeAdapter = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-
-    summary = orch.run(fresh=True)
-    assert summary["ok"], summary
+def test_pipeline_completes_single_stage(project_root: Path) -> None:
+    _orch, summary = _run(project_root, SINGLE_STAGE_YAML)
+    assert summary["ok"] is True
     assert summary["status"] == "complete"
-    assert summary["stages_run"] >= 5
-    # state.yaml exists
+    assert (project_root / "output" / "out.md").exists()
+
+
+def test_pipeline_two_stages_chains_via_upstream(project_root: Path) -> None:
+    _orch, summary = _run(project_root, TWO_STAGE_YAML)
+    assert summary["ok"] is True
+    assert (project_root / "output" / "gen.md").exists()
+    assert (project_root / "output" / "review.md").exists()
+
+
+def test_registry_persisted_after_run(project_root: Path) -> None:
+    orch, _summary = _run(project_root, SINGLE_STAGE_YAML)
     state_path = project_root / ".novelforge" / "state.yaml"
-    assert state_path.exists()
-    state = yaml.safe_load(state_path.read_text(encoding="utf-8"))
-    assert state["current_stage"] is None or state["current_stage"] == "review_chapter"
-    # Checkpoints exist for every stage
-    ck_dir = project_root / ".novelforge" / "checkpoints"
-    assert (ck_dir / "generate_outline-001.yaml").exists()
-    assert (ck_dir / "review_outline-001.yaml").exists()
-    assert (ck_dir / "write_chapter-001.yaml").exists()
-    # Output files exist
-    assert (project_root / "output" / "summaries" / "plot.md").exists()
-    assert (project_root / "output" / "summaries" / "outline-tracking.md").exists()
-    assert (project_root / "output" / "chapters").glob("*.md")
+    raw = yaml.safe_load(state_path.read_text())
+    artifacts = raw.get("extra", {}).get("artifacts", {})
+    assert "write" in artifacts
+    assert "out" in artifacts["write"]
 
 
-def test_run_records_token_usage(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-    orch.run(fresh=True)
-    log_path = project_root / ".novelforge" / "logs" / "token-usage.log"
-    assert log_path.exists()
-    lines = log_path.read_text(encoding="utf-8").splitlines()
-    assert all(json.loads(l) for l in lines)
-    # at least one record per stage
-    stages = {json.loads(l)["stage"] for l in lines}
-    assert {"generate_outline", "write_chapter"}.issubset(stages)
+def test_state_attempts_zero_after_success(project_root: Path) -> None:
+    _orch, _summary = _run(project_root, SINGLE_STAGE_YAML)
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    attempts = raw.get("extra", {}).get("stage_attempts", {})
+    assert attempts.get("write") == 0
 
 
 # --------------------------------------------------------------------------- #
-# Resume / pause
+# C-tier retry (StageIncomplete / VerifyFailed)
 # --------------------------------------------------------------------------- #
 
 
-def test_resume_skips_completed_stages(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
+def test_stage_incomplete_recovers_on_second_attempt(project_root: Path) -> None:
+    """NO_SIGNAL first invoke → StageIncomplete → second invoke recovers."""
 
-    # First run gets to design_characters, we "interrupt" by pausing
-    # manually (set paused=True in state).
-    orch.run(fresh=True)
-    # Reset mock calls; second run should still complete from where we left off.
-    mock.calls.clear()
-    summary = orch.run(fresh=False)
-    assert summary["ok"], summary
-    # all stages already complete, so 0 new stages were run
-    assert summary["stages_run"] == 0
-    assert summary["status"] == "complete"
-
-
-def test_paused_state_resumes_on_explicit_resume(project_root: Path) -> None:
-    """Spec: "暂停状态可被 resume 命令拉起".
-
-    When the user explicitly calls resume (fresh=False), the paused flag
-    is cleared so the pipeline attempts to continue.  If the underlying
-    issue persists the pipeline will pause again.
-    """
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-
-    # Manually set paused state with a current_stage and a checkpoint
-    # for the stage *before* write_chapter so recovery can find it.
-    store = StateStore(project_root / ".novelforge")
-    store.write(
-        current_stage="write_chapter",
-        paused=True,
-        paused_reason="WriteFailure",
+    _orch, summary = _run(
+        project_root,
+        SINGLE_STAGE_YAML,
+        mock_env={"NOVELFORGE_MOCK_NO_SIGNAL": "1"},
     )
-    # Write a checkpoint for design_characters so recovery_plan finds it
-    from novelforge.state import Checkpoint
-    from novelforge.utils.fs import sha256_file
+    assert summary["ok"] is True, summary
+    # The mock omits the signal exactly once, then recovers.
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    assert raw.get("extra", {}).get("stage_attempts", {}).get("write") == 0
 
-    (project_root / "output").mkdir(exist_ok=True)
-    dummy = project_root / "output" / "dummy.txt"
-    dummy.write_text("data", encoding="utf-8")
-    store.write_checkpoint(
-        Checkpoint(
-            stage="design_characters",
-            batch="001",
-            files=[{"path": str(dummy.relative_to(project_root)), "sha256": sha256_file(dummy), "size": "4"}],
-            timestamp="2026-06-06T00:00:00+0000",
-        )
+
+def test_verify_failed_recovers_on_second_attempt(project_root: Path) -> None:
+    """EMPTY first invoke → VerifyFailed → second invoke recovers."""
+
+    _orch, summary = _run(
+        project_root,
+        SINGLE_STAGE_YAML,
+        mock_env={"NOVELFORGE_MOCK_EMPTY": "1"},
     )
-
-    summary = orch.run(fresh=False)
-    # The paused flag was cleared, and the pipeline should have continued.
-    assert summary["ok"], summary
-    assert summary["stages_run"] >= 1
-    # Verify the paused flag was cleared in state
-    final_state = store.load()
-    assert final_state.paused is False
+    assert summary["ok"] is True, summary
 
 
-def test_fundamental_issue_pauses(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    fund = MockResponse(
-        output=json.dumps(
-            {"passed": False, "route": "FUNDAMENTAL_ISSUE", "findings": ["x"]}
-        ),
-        parsed={"passed": False, "route": "FUNDAMENTAL_ISSUE", "findings": ["x"]},
+def test_max_attempts_exhausted_applies_on_failure_pause(project_root: Path) -> None:
+    """ALWAYS_FAIL + max_attempts=2 → pause."""
+
+    _orch, summary = _run(
+        project_root,
+        SINGLE_STAGE_YAML,
+        mock_env={"NOVELFORGE_MOCK_ALWAYS_FAIL": "1"},
     )
-    mock.set_response("review_outline", fund)
-    orch._adapter = mock  # type: ignore[assignment]
-    summary = orch.run(fresh=True)
-    assert summary["paused"]
-    assert summary["paused_reason"] == "FUNDAMENTAL_ISSUE"
-    # state reflects the pause
-    state = StateStore(project_root / ".novelforge").load()
-    assert state.paused is True
-    assert state.paused_reason == "FUNDAMENTAL_ISSUE"
-
-
-def test_needs_rewrite_loops_review(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    needs_rewrite = MockResponse(
-        output=json.dumps(
-            {
-                "passed": False,
-                "route": "NEEDS_REWRITE",
-                "findings": ["tighten the hook"],
-                "required_changes": ["add foreshadowing"],
-            }
-        ),
-        parsed={
-            "passed": False,
-            "route": "NEEDS_REWRITE",
-            "findings": ["tighten the hook"],
-            "required_changes": ["add foreshadowing"],
-        },
-    )
-    mock.set_response("review_outline", needs_rewrite)
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-    summary = orch.run(fresh=True)
-    # review_outline loops once with needs_rewrite, then we move on.
-    assert summary["ok"], summary
-    # the review_outline stage should have been called at least twice.
-    review_calls = [c for c in mock.calls if c["stage"] == "review_outline"]
-    assert len(review_calls) >= 2
+    assert summary["paused"] is True
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    assert raw.get("extra", {}).get("stage_attempts", {}).get("write") == 2
 
 
 # --------------------------------------------------------------------------- #
-# Review-loop ceiling: bug regressions
+# on_failure dispositions
 # --------------------------------------------------------------------------- #
 
 
-def test_review_loop_warning_records_review_stage_not_next(project_root: Path) -> None:
-    """Regression: when ``review_X`` hits the loop ceiling the warning
-    entry must record ``stage: review_X``, not the *next* stage that
-    follows it in the pipeline (the prior implementation mis-attributed
-    the warning to the next stage).
-    """
+SKIP_YAML = """
+novel:
+  title: T
+  genre: T
+  target_chapters: 1
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
+  constraints: [CLAUDE.md]
+pipeline:
+  stages:
+    - id: a
+      model: m
+      prompt: A.
+      produces:
+        - path: output/a.md
+          alias: a
+      on_failure: skip
+      done_when:
+        max_attempts: 2
+    - id: b
+      model: m
+      prompt: B.
+      produces:
+        - path: output/b.md
+          alias: b
+execution:
+  retry:
+    backoff: constant
+    max_wait: 1
+"""
 
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    # review_outline always returns NEEDS_REWRITE; the configured
-    # max_review_iterations is 2, so iterations 3, 4, … all hit the
-    # loop ceiling and accept the current version.
-    needs_rewrite = MockResponse(
-        output=json.dumps(
-            {"passed": False, "route": "NEEDS_REWRITE", "findings": ["x"]}
-        ),
-        parsed={"passed": False, "route": "NEEDS_REWRITE", "findings": ["x"]},
+
+def test_on_failure_skip_advances_to_next_stage(project_root: Path) -> None:
+    """Stage 'a' always fails; with on_failure:skip, 'b' still runs and
+    succeeds."""
+
+    from novelforge.claude.adapter import MockClaudeAdapter, MockResponse
+
+    cfg_path = _write_yaml(project_root, SKIP_YAML)
+    cfg = load_config(cfg_path)
+    orch = Orchestrator(
+        config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
     )
-    mock.set_response("review_outline", needs_rewrite)
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
+    # Build a mock adapter with per-stage canned responses:
+    # - stage 'a' omits the signal on every invoke → exhausts max_attempts.
+    # - stage 'b' emits a normal body + signal.
+    mock = MockClaudeAdapter()
+    mock.set_response("a", MockResponse(output="always-fails", omit_signal=True))
+    mock.set_response(
+        "b", MockResponse(output="The chapter content unfolds with care. " * 5)
+    )
+    orch._adapter = mock  # type: ignore[attr-defined]
+
     summary = orch.run(fresh=True)
-    assert summary["ok"], summary
-    state = StateStore(project_root / ".novelforge").load()
-    warnings = state.extra.get("review_loop_warnings", [])
-    assert warnings, "expected a review_loop_warnings entry"
-    # Every warning must point at the review stage that hit the loop,
-    # not at the next stage.  Here only review_outline should appear.
-    bad = [w for w in warnings if w["stage"] != "review_outline"]
-    assert not bad, (
-        f"review_loop_warnings stage mis-attributed: {warnings}"
-    )
+    assert summary["ok"] is True, summary
+    assert (project_root / "output" / "b.md").exists()
 
 
-def test_last_review_iterations_survives_subsequent_stages(project_root: Path) -> None:
-    """Regression: ``state.last_review_iterations`` must keep the
-    iteration count from the most recent review even after a non-review
-    stage (e.g. ``design_characters``) runs and overwrites it.
-    """
-
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    # review_outline approves on the first try (iter_count=1).
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-    summary = orch.run(fresh=True)
-    assert summary["ok"], summary
-    state = StateStore(project_root / ".novelforge").load()
-    # After review_outline approved at iteration 1, and subsequent
-    # stages have run, the field should still read 1, not 0.
-    assert state.last_review_iterations == 1, (
-        f"last_review_iterations was clobbered; got {state.last_review_iterations}"
-    )
+# --------------------------------------------------------------------------- #
+# Batch driving (D14)
+# --------------------------------------------------------------------------- #
 
 
-def test_review_loop_ceiling_checkpoint_batch_is_not_decision_reason(
+BATCH_YAML = """
+novel:
+  title: T
+  genre: T
+  target_chapters: 1
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
+  constraints: [CLAUDE.md]
+pipeline:
+  stages:
+    - id: batched
+      model: m
+      prompt: Write.
+      produces:
+        - path: output/ch-{{num:03d}}.md
+          alias: chapter
+      batch: 3
+      done_when:
+        max_attempts: 2
+        checks:
+          - kind: min_chars
+            target: output/ch-{{num:03d}}.md
+            value: 5
+execution:
+  retry:
+    backoff: constant
+    max_wait: 1
+"""
+
+
+def test_batch_driving_writes_one_file_per_item(project_root: Path) -> None:
+    _orch, summary = _run(project_root, BATCH_YAML)
+    assert summary["ok"] is True, summary
+    for i in (1, 2, 3):
+        assert (project_root / "output" / f"ch-{i:03d}.md").exists()
+
+
+def test_batch_attempts_persisted_as_list(project_root: Path) -> None:
+    _orch, _summary = _run(project_root, BATCH_YAML)
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    attempts = raw.get("extra", {}).get("stage_attempts", {}).get("batched")
+    assert isinstance(attempts, list)
+    assert len(attempts) == 3
+    assert all(a == 0 for a in attempts)
+
+
+MULTI_PRODUCE_BATCH_YAML = """
+novel:
+  title: T
+  genre: T
+  target_chapters: 1
+  words_per_chapter: [100, 200]
+  style: x
+  seeds: [outline/premise.md]
+  constraints: [CLAUDE.md]
+pipeline:
+  stages:
+    - id: batched
+      model: m
+      prompt: Write.
+      produces:
+        - path: output/a-{{num:03d}}.md
+          alias: alpha
+        - path: output/b-{{num:03d}}.md
+          alias: beta
+      batch: 3
+      done_when:
+        max_attempts: 2
+execution:
+  retry:
+    backoff: constant
+    max_wait: 1
+"""
+
+
+def test_multi_produce_batch_registers_each_alias_as_list(
     project_root: Path,
 ) -> None:
-    """Regression: the ReviewLoopExceeded branch previously wrote a
-    checkpoint file with the *decision reason* (e.g. ``fresh_start``) as
-    its batch suffix, producing junk files like
-    ``review_chapter-fresh_start.yaml``.  The batch must be a real
-    chapter/iteration index instead.
-    """
+    """AC-7: every produces[].alias of a batch stage must end up as a
+    length-N list in the registry (not just ``produces[0]``)."""
 
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    needs_rewrite = MockResponse(
-        output=json.dumps(
-            {"passed": False, "route": "NEEDS_REWRITE", "findings": ["x"]}
-        ),
-        parsed={"passed": False, "route": "NEEDS_REWRITE", "findings": ["x"]},
+    _orch, summary = _run(project_root, MULTI_PRODUCE_BATCH_YAML)
+    assert summary["ok"] is True, summary
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    artifacts = raw.get("extra", {}).get("artifacts", {}).get("batched", {})
+    alpha = artifacts.get("alpha")
+    beta = artifacts.get("beta")
+    assert isinstance(alpha, list) and len(alpha) == 3, (
+        f"alpha should be a list of length 3; got {alpha!r}"
     )
-    mock.set_response("review_outline", needs_rewrite)
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-    orch.run(fresh=True)
-    ck_dir = project_root / ".novelforge" / "checkpoints"
-    # No checkpoint should use a non-numeric batch suffix.
-    for ck in ck_dir.glob("review_outline-*.yaml"):
-        stem = ck.stem  # e.g. "review_outline-001"
-        suffix = stem.split("-", 1)[1] if "-" in stem else ""
-        assert suffix.isdigit(), (
-            f"checkpoint batch suffix must be numeric, got {ck.name}"
+    assert isinstance(beta, list) and len(beta) == 3, (
+        f"beta should be a list of length 3; got {beta!r}"
+    )
+    # The two alias lists must not cross-contaminate.
+    alpha_names = {Path(p).name for p in alpha}
+    beta_names = {Path(p).name for p in beta}
+    assert all(n.startswith("a-") for n in alpha_names), alpha_names
+    assert all(n.startswith("b-") for n in beta_names), beta_names
+
+
+def test_batch_corrupt_length_detected(tmp_path: Path) -> None:
+    """A persisted attempts list whose length != batch:N is treated as
+    a corrupt checkpoint and surfaces a StateError."""
+
+    # Bootstrap a half-finished state.
+    (tmp_path / "outline").mkdir()
+    (tmp_path / "outline" / "premise.md").write_text("# Premise\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("# Style\n", encoding="utf-8")
+    cfg_path = _write_yaml(tmp_path, BATCH_YAML)
+    state_dir = tmp_path / ".novelforge"
+    state_dir.mkdir()
+    state_path = state_dir / "state.yaml"
+    state_path.write_text(
+        yaml.safe_dump(
+            {
+                "current_stage": "batched",
+                "extra": {
+                    "stage_attempts": {"batched": [0, 0]},  # wrong length
+                },
+            }
         )
+    )
+    cfg = load_config(cfg_path)
+    orch = Orchestrator(
+        config=cfg, config_path=cfg_path, project_root=tmp_path, use_mock=True,
+    )
+    summary = orch.run(fresh=False)
+    # We don't enforce the exact error type at the public boundary; we
+    # only require that the pipeline surfaces as paused (not crashed).
+    assert summary["paused"] is True or summary["ok"] is False
 
 
 # --------------------------------------------------------------------------- #
-# Status command payload
+# Resume attempts reset (AC-10)
 # --------------------------------------------------------------------------- #
 
 
-def test_status_payload_reflects_state(project_root: Path) -> None:
-    orch = _orchestrator(project_root)
-    mock = orch._build_adapter()  # type: ignore[assignment]
-    mock.set_response("generate_outline", _outline_response())
-    mock.set_response("review_outline", _approved_review("review_outline"))
-    mock.set_response("design_characters", _characters_response())
-    mock.set_response("write_chapter", _chapter_response())
-    mock.set_response("review_chapter", _approved_review("review_chapter"))
-    orch._adapter = mock  # type: ignore[assignment]
-    orch.run(fresh=True)
-    from novelforge.cli import status  # late import to avoid heavy deps
+def test_resume_resets_attempts_for_paused_stage(project_root: Path) -> None:
+    """AC-10: after ``on_failure: pause`` triggers, the next
+    ``novelforge run`` must reset the paused stage's attempt counter
+    to 0 so the user gets a fresh ``max_attempts`` budget.
 
-    from typer.testing import CliRunner
-
-    from novelforge.cli import app
-
-    cfg_path = project_root / "novel-project.yaml"
-    runner = CliRunner()
-    result = runner.invoke(app, ["status", "--config", str(cfg_path)])
-    assert result.exit_code == 0, result.stdout
-    payload = json.loads(result.stdout)
-    assert "current_stage" in payload
-    assert payload["target_chapters"] == 1
-    assert "progress" in payload
-    assert "token_usage" in payload
-    assert "last_checkpoint_at" in payload
-
-
-def test_status_reads_actual_persisted_state(project_root: Path) -> None:
-    """Regression: status command must load real state values, not defaults.
-
-    Previously, ``StateStore`` was constructed with the state *file* path
-    instead of the *directory* path, which caused ``load()`` to return
-    a fresh default ``State()`` — silently hiding paused / token info.
+    Without the reset, the counter would start at ``max_attempts``
+    and immediately re-trigger ``on_failure`` after one invoke.
     """
 
-    from typer.testing import CliRunner
+    cfg_path = _write_yaml(project_root, SINGLE_STAGE_YAML)
+    cfg = load_config(cfg_path)
+    saved = os.environ.get("NOVELFORGE_MOCK_ALWAYS_FAIL", "")
+    os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = "1"
+    try:
+        orch1 = Orchestrator(
+            config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
+        )
+        summary1 = orch1.run(fresh=True)
+    finally:
+        if saved:
+            os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = saved
+        else:
+            os.environ.pop("NOVELFORGE_MOCK_ALWAYS_FAIL", None)
+    assert summary1["paused"] is True
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw = yaml.safe_load(state_path.read_text())
+    assert raw["extra"]["stage_attempts"]["write"] == 2
 
-    from novelforge.cli import app
-
-    # Create the config file so validate/load succeeds
-    cfg_path = _write_yaml(project_root)
-
-    # Write a non-trivial paused state directly
-    store = StateStore(project_root / ".novelforge")
-    store.write(
-        current_stage="write_chapter",
-        paused=True,
-        paused_reason="WriteFailure exhausted",
+    # Resume with ALWAYS_FAIL still set.  Without the AC-10 reset the
+    # counter would jump straight to 3 (2 + 1) and re-pause; with the
+    # reset it re-accumulates from 0 to ``max_attempts`` (=2).
+    os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = "1"
+    try:
+        orch2 = Orchestrator(
+            config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
+        )
+        summary2 = orch2.run(fresh=False)
+    finally:
+        if saved:
+            os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = saved
+        else:
+            os.environ.pop("NOVELFORGE_MOCK_ALWAYS_FAIL", None)
+    assert summary2["paused"] is True
+    raw2 = yaml.safe_load(state_path.read_text())
+    assert raw2["extra"]["stage_attempts"]["write"] == 2, (
+        f"AC-10 violation: resume should reset attempts to 0 then "
+        f"re-accumulate to max_attempts=2; got "
+        f"{raw2['extra']['stage_attempts']['write']}"
     )
-    s = store.load()
-    s.token_usage["total_input"] = 9999
-    s.token_usage["total_output"] = 42
-    s.progress["chapters_written"] = 3
-    store.save(s)
 
-    runner = CliRunner()
-    result = runner.invoke(app, ["status", "--config", str(cfg_path)])
-    assert result.exit_code == 0, result.stdout
-    payload = json.loads(result.stdout)
 
-    # These values MUST match what was persisted — not the defaults.
-    assert payload["paused"] is True
-    assert payload["paused_reason"] == "WriteFailure exhausted"
-    assert payload["current_stage"] == "write_chapter"
-    assert payload["token_usage"]["total_input"] == 9999
-    assert payload["token_usage"]["total_output"] == 42
-    assert payload["progress"]["chapters_written"] == 3
+def test_resume_succeeds_when_failure_cleared(project_root: Path) -> None:
+    """AC-10 follow-up: after pause + resume, the stage can succeed
+    within a fresh ``max_attempts`` budget (mock reverts to default
+    behavior on the second run)."""
+
+    cfg_path = _write_yaml(project_root, SINGLE_STAGE_YAML)
+    cfg = load_config(cfg_path)
+    saved = os.environ.get("NOVELFORGE_MOCK_ALWAYS_FAIL", "")
+    os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = "1"
+    try:
+        orch1 = Orchestrator(
+            config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
+        )
+        summary1 = orch1.run(fresh=True)
+    finally:
+        if saved:
+            os.environ["NOVELFORGE_MOCK_ALWAYS_FAIL"] = saved
+        else:
+            os.environ.pop("NOVELFORGE_MOCK_ALWAYS_FAIL", None)
+    assert summary1["paused"] is True
+
+    # Resume without ALWAYS_FAIL — stage should now succeed and clear
+    # the attempts counter.
+    orch2 = Orchestrator(
+        config=cfg, config_path=cfg_path, project_root=project_root, use_mock=True,
+    )
+    summary2 = orch2.run(fresh=False)
+    assert summary2["ok"] is True, summary2
+    state_path = project_root / ".novelforge" / "state.yaml"
+    raw2 = yaml.safe_load(state_path.read_text())
+    assert raw2["extra"]["stage_attempts"]["write"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# AC-18 / AC-15: no v3 routes
+# --------------------------------------------------------------------------- #
+
+
+def test_no_v3_route_strings_in_orchestrator_source() -> None:
+    src_path = Path(__file__).resolve().parent.parent / "src" / "novelforge" / "orchestrator.py"
+    text = src_path.read_text(encoding="utf-8")
+    for forbidden in ("NEEDS_REWRITE", "FUNDAMENTAL_ISSUE", "APPROVED"):
+        assert forbidden not in text, f"orchestrator.py still mentions {forbidden!r}"

@@ -1,5 +1,14 @@
 # Write Chapter — prompt
 
-Write the next chapter(s) of the novel.  Use the outline beat above as
-your target.  Output ``# Chapter N - <Title>`` followed by 800-1500
-Chinese characters of prose per chapter.  End on a small reversal.
+You are writing one chapter of a long-form webnovel.  The orchestrator
+has attached the upstream outline via the
+`{{upstream.generate_outline.outline}}` placeholder; read it for the
+chapter beat you must hit.
+
+Output a single chapter in markdown.  The chapter must:
+
+- Open with `## Chapter 1 - <Title>` so the engine can detect it.
+- Contain 400–1500 Chinese characters of prose.
+- End on a small reversal as required by the project's CLAUDE.md.
+
+Do not output anything other than the chapter itself.

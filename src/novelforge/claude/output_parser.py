@@ -1,26 +1,28 @@
-"""Output-form inference + parsing for v4 stages.
+"""Output-form parsing for v4 contract stages.
 
-The v4 yaml makes ``output:`` a single string template, e.g.::
+The v4 contract makes ``produces`` a list of :class:`ProduceSpec`
+records.  Each produce declares:
 
-    output/review/chapter-review.json
-    output/chapters/{{num:03d}}-{{title|slug}}.md
-    output/summaries/plot.md
+- ``path`` — the destination template (possibly with ``{{num}}`` /
+  ``{{name}}`` placeholders).
+- ``alias`` — the downstream-facing identifier.
+- ``split`` — an optional regex; when set, a single model response is
+  sliced into multiple files (one per regex match).
 
-The engine needs to know **what to do** with the model's response:
+Three storage forms are recognised (spec §AC-1, AC-7, AC-8):
 
-- ``text``  — write the raw output verbatim to a single file.
-- ``json``  — parse the response as JSON, validate, write the JSON to
+- ``text`` — write the raw output verbatim to a single file.
+- ``json`` — parse the response as JSON, validate, write the JSON to
   the file.
 - ``split`` — split the response on a regex (one match per file) and
   render the file name from each match's capture groups.
 
 Rules (per spec §5.4):
 
-- Final suffix ``.json`` ⇒ ``json``.
-- Contains ``{{x}}`` placeholder ⇒ ``split`` (must have ``split``
-  regex).
+- Final suffix ``.json`` ⇒ ``json`` (when ``split`` is not set).
+- ``split`` field ⇒ ``split`` (incompatible with ``.json`` suffix,
+  enforced in :mod:`novelforge.config`).
 - Otherwise ⇒ ``text``.
-- ``.json`` + ``{{x}}`` is illegal (A15).
 """
 
 from __future__ import annotations
@@ -29,46 +31,38 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from ..errors import OutputParseError, SchemaInvalid
+from ..config import ProduceSpec
+from ..errors import OutputParseError, SchemaInvalid, VerifyFailed
 from ..utils.fs import atomic_write, ensure_dir
 from ..utils.log import get_logger
 
 log = get_logger("claude.output_parser")
 
-OutputForm = Literal["text", "json", "split"]
+# OutputForm kept as a string alias for backwards compatibility.
+OutputForm = str
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
 # --------------------------------------------------------------------------- #
-# Inference
+# Inference (pure function over a single path string)
 # --------------------------------------------------------------------------- #
 
 
-def infer_form(path_template: str) -> OutputForm:
-    """Return the output form implied by the ``output:`` template.
+def infer_form(path_template: str) -> str:
+    """Return ``"text"`` or ``"json"`` based on the path's suffix.
 
-    Raises:
-        ValueError: when the template mixes ``.json`` suffix with
-            ``{{x}}`` placeholders (spec A15).
+    Note (spec §AC-16): ``split`` is *not* inferred from the path; it
+    is triggered by the ``produces[].split`` field.  This function
+    keeps the v3 signature (single path string) so existing call sites
+    that don't care about split still work.
     """
 
     if not isinstance(path_template, str) or not path_template.strip():
         raise ValueError("output template must be a non-empty string")
-    ends_with_json = path_template.rstrip().endswith(".json")
-    has_placeholder = PLACEHOLDER_RE.search(path_template) is not None
-    if ends_with_json and has_placeholder:
-        raise ValueError(
-            f"output template {path_template!r} mixes .json suffix with "
-            f"{{{{...}}}} placeholders; .json output is single-object only. "
-            f"Either drop the placeholder (single JSON file) or change the "
-            f"suffix (e.g. .md with split)."
-        )
-    if ends_with_json:
+    if path_template.rstrip().endswith(".json"):
         return "json"
-    if has_placeholder:
-        return "split"
     return "text"
 
 
@@ -78,32 +72,32 @@ def infer_form(path_template: str) -> OutputForm:
 
 
 @dataclass
-class ParseResult:
-    """Result of parsing a model's raw output.
+class ProduceParseResult:
+    """Per-produce parse outcome."""
 
-    Field semantics depend on the form:
-
-    - ``text``  → ``written_path`` set, ``text`` set.
-    - ``json``  → ``written_path`` set, ``data`` set.
-    - ``split`` → ``written_paths`` (>= 1) and ``segments`` (same
-      length).  Each ``segments[i]`` carries the raw text + the
-      regex match's capture groups under ``matches`` so the
-      orchestrator can pull a ``route`` from any segment.
-
-    On failure, callers should raise :class:`OutputParseError` or
-    :class:`SchemaInvalid` instead of returning a partial ParseResult.
-    """
-
-    form: OutputForm
-    written_path: Optional[Path] = None
-    written_paths: list[Path] = field(default_factory=list)
-    text: Optional[str] = None
-    data: Optional[dict[str, Any]] = None
+    alias: str
+    form: str  # "text" | "json" | "split"
+    paths: list[Path] = field(default_factory=list)
+    parsed: Optional[dict[str, Any]] = None  # JSON form only
     segments: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class ParseResult:
+    """Aggregate parse result for one stage invocation."""
+
+    produces: list[ProduceParseResult] = field(default_factory=list)
+
+    @property
+    def all_paths(self) -> list[Path]:
+        out: list[Path] = []
+        for p in self.produces:
+            out.extend(p.paths)
+        return out
+
+
 # --------------------------------------------------------------------------- #
-# Render placeholders
+# Path template rendering (placeholder substitution)
 # --------------------------------------------------------------------------- #
 
 
@@ -117,13 +111,8 @@ def _slugify(value: str, max_len: int = 60) -> str:
 
 
 def _format_value(raw: str, value: Any) -> str:
-    """Apply a single placeholder format spec to ``value``.
+    """Apply a single placeholder format spec to ``value``."""
 
-    Supported spec: ``:03d`` style integer padding, ``|slug`` slugify.
-    Bare ``{{x}}`` uses ``str(value)``.
-    """
-
-    # Split off the filter (everything after ``|``).
     if "|" in raw:
         head, _, filt = raw.partition("|")
         head = head.strip()
@@ -132,8 +121,6 @@ def _format_value(raw: str, value: Any) -> str:
         head, filt = raw.strip(), ""
     if filt == "slug":
         return _slugify("" if value is None else str(value))
-    # Numeric padding: the head looks like ``name:03d``.  Extract the
-    # spec after the colon.
     spec = head
     if ":" in spec:
         spec = spec.split(":", 1)[1].strip()
@@ -151,19 +138,14 @@ def _format_value(raw: str, value: Any) -> str:
 
 def render_path_template(
     path_template: str,
-    values: Optional[dict[str, Any]] = None,
+    values: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Substitute ``{{var}}`` / ``{{var:03d}}`` / ``{{var|slug}}`` markers.
-
-    Unknown variables raise :class:`OutputParseError` so a typo in the
-    yaml is loud rather than silent.
-    """
+    """Substitute ``{{var}}`` / ``{{var:03d}}`` / ``{{var|slug}}`` markers."""
 
     values = values or {}
 
     def repl(match: re.Match[str]) -> str:
         raw = match.group(1).strip()
-        # Look up the *name* (the part before ``:`` or ``|``).
         name = raw
         for sep in (":", "|"):
             if sep in name:
@@ -196,9 +178,22 @@ def _write_json_file(
     *,
     stage_id: str,
 ) -> tuple[Path, dict[str, Any]]:
-    """Parse ``raw_output`` as JSON, validate, and write to ``target``."""
-
-    payload, err = _parse_json_object(raw_output, stage_id=stage_id)
+    # Empty output is a Tier C "model incomplete" case (spec §4.3:
+    # "没写产物 / 写残") — the model produced nothing, so the stage
+    # deserves a whole-stage retry with an ``attempt_hint`` rather than
+    # an immediate Tier B pause.  Raising VerifyFailed routes through
+    # the same C-tier loop as the second-layer check failures.
+    if not (raw_output or "").strip():
+        raise VerifyFailed(
+            f"stage {stage_id!r}: output is declared as .json but the "
+            f"model returned empty output",
+            stage_id=stage_id,
+            target=str(target),
+            kind="json_field",
+            expected="valid JSON object",
+            actual="empty",
+        )
+    payload, err = _parse_json_object(raw_output)
     if err is not None:
         raise SchemaInvalid(
             f"stage {stage_id!r}: output is declared as .json but the "
@@ -214,16 +209,7 @@ def _write_json_file(
 
 def _parse_json_object(
     raw_output: str,
-    *,
-    stage_id: str,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Best-effort JSON object extraction.
-
-    Mirrors the heuristics in :func:`novelforge.review.schema.parse_review_payload`
-    (last fenced code block, last {…} block, full strip) so model
-    output that includes prose around a JSON blob still parses.
-    """
-
     raw = (raw_output or "").strip()
     if not raw:
         return None, "empty output"
@@ -250,6 +236,19 @@ def _parse_json_object(
     return obj, None
 
 
+def _strip_completion_signal(raw_output: str, signal: Optional[str]) -> str:
+    """Remove the trailing completion signal line so it isn't written to file."""
+
+    if not signal:
+        return raw_output
+    # Remove the signal anywhere it appears as a line of its own.  The
+    # mock adapter always puts it on its own line; real models may do
+    # the same.
+    lines = (raw_output or "").splitlines()
+    kept = [ln for ln in lines if signal not in ln]
+    return "\n".join(kept).rstrip()
+
+
 # --------------------------------------------------------------------------- #
 # Public parse()
 # --------------------------------------------------------------------------- #
@@ -257,95 +256,126 @@ def _parse_json_object(
 
 def parse(
     raw_output: str,
-    form: OutputForm,
+    produces: Sequence[ProduceSpec],
     *,
-    output_template: str,
-    split_regex: Optional[str],
     project_root: Path,
     stage_id: str,
-    placeholder_values: Optional[dict[str, Any]] = None,
+    placeholder_values: Optional[Mapping[str, Any]] = None,
+    completion_signal: Optional[str] = None,
 ) -> ParseResult:
-    """Persist ``raw_output`` according to the inferred ``form``.
+    """Persist ``raw_output`` according to the declared ``produces``.
 
     Args:
         raw_output: the model's response text.
-        form: one of ``"text"``, ``"json"``, ``"split"``.
-        output_template: the v4 ``output:`` template (used to render
-            the target path / paths).
-        split_regex: required when ``form == "split"``.  Each match
-            must contain a ``num`` capture group (used as the segment
-            index) and may contain any other named groups; those are
-            passed back in ``ParseResult.segments[i].matches`` so the
-            caller can also render file names from them.
+        produces: the stage's :class:`ProduceSpec` records (one or more).
         project_root: file destination root.
         stage_id: used in error messages only.
         placeholder_values: values for the ``{{var}}`` placeholders in
-            the output template.  ``num`` and ``title`` are the common
-            ones for the split form.
+            each ``produces[].path`` (e.g. ``num`` for batch items).
+        completion_signal: when set, the matching marker is stripped
+            from the body before writing so it never lands on disk.
     """
 
-    if form == "text":
-        rendered = render_path_template(output_template, placeholder_values or {})
-        target = project_root / rendered
-        path = _write_text_file(target, raw_output)
-        return ParseResult(form="text", written_path=path, text=raw_output)
-    if form == "json":
-        rendered = render_path_template(output_template, placeholder_values or {})
-        target = project_root / rendered
-        path, data = _write_json_file(target, raw_output, stage_id=stage_id)
-        return ParseResult(form="json", written_path=path, data=data)
-    if form == "split":
-        if not split_regex:
-            raise OutputParseError(
-                f"stage {stage_id!r}: output template {output_template!r} "
-                f"contains placeholders but no `split` regex was given"
+    placeholders = dict(placeholder_values or {})
+    body_for_files = _strip_completion_signal(raw_output, completion_signal)
+    result = ParseResult()
+
+    for produce in produces:
+        if produce.split:
+            sub = _parse_split_produce(
+                body_for_files,
+                produce,
+                project_root=project_root,
+                stage_id=stage_id,
+                placeholders=placeholders,
             )
-        try:
-            pattern = re.compile(split_regex, re.MULTILINE)
-        except re.error as exc:
-            raise OutputParseError(
-                f"stage {stage_id!r}: split regex is invalid: {exc}"
-            ) from exc
-        matches = list(pattern.finditer(raw_output or ""))
-        if not matches:
-            raise OutputParseError(
-                f"stage {stage_id!r}: split regex did not match the model "
-                f"output (first 200 chars): "
-                f"{(raw_output or '')[:200]!r}"
+            result.produces.append(sub)
+            continue
+        form = produce.form  # "text" | "json"
+        if form == "json":
+            target_rel = render_path_template(produce.path, placeholders)
+            target = (Path(project_root) / target_rel).resolve()
+            path, payload = _write_json_file(target, body_for_files, stage_id=stage_id)
+            result.produces.append(
+                ProduceParseResult(
+                    alias=produce.alias,
+                    form="json",
+                    paths=[path],
+                    parsed=payload,
+                )
             )
-        written: list[Path] = []
-        segments: list[dict[str, Any]] = []
-        # Default segment index → start counting at 1 when ``num`` is
-        # absent so file names are still unique.
-        for idx, m in enumerate(matches, start=1):
-            groups = {k: v for k, v in m.groupdict().items() if v is not None}
-            if "num" not in groups:
-                groups["num"] = idx
-            rendered_name = render_path_template(output_template, groups)
-            target = project_root / rendered_name
-            start = m.end()
-            end = matches[idx].start() if idx < len(matches) else len(raw_output)
-            body = (raw_output or "")[start:end].strip()
-            path = _write_text_file(target, body + "\n")
-            written.append(path)
-            segments.append(
-                {
-                    "raw_text": body,
-                    "matches": groups,
-                    "path": path,
-                }
+        else:
+            target_rel = render_path_template(produce.path, placeholders)
+            target = (Path(project_root) / target_rel).resolve()
+            path = _write_text_file(target, body_for_files)
+            result.produces.append(
+                ProduceParseResult(
+                    alias=produce.alias,
+                    form="text",
+                    paths=[path],
+                )
             )
-        return ParseResult(
-            form="split",
-            written_paths=written,
-            segments=segments,
+    return result
+
+
+def _parse_split_produce(
+    raw_output: str,
+    produce: ProduceSpec,
+    *,
+    project_root: Path,
+    stage_id: str,
+    placeholders: Mapping[str, Any],
+) -> ProduceParseResult:
+    """Apply the produce's split regex and write each match as its own file."""
+
+    try:
+        pattern = re.compile(produce.split or "", re.MULTILINE)
+    except re.error as exc:
+        raise OutputParseError(
+            f"stage {stage_id!r}: split regex for alias {produce.alias!r} "
+            f"is invalid: {exc}"
+        ) from exc
+    matches = list(pattern.finditer(raw_output or ""))
+    if not matches:
+        raise OutputParseError(
+            f"stage {stage_id!r}: split regex for alias {produce.alias!r} "
+            f"did not match the model output "
+            f"(first 200 chars): {(raw_output or '')[:200]!r}"
         )
-    raise OutputParseError(f"unknown output form: {form!r}")
+    written: list[Path] = []
+    segments: list[dict[str, Any]] = []
+    for idx, m in enumerate(matches, start=1):
+        groups = {k: v for k, v in m.groupdict().items() if v is not None}
+        if "num" not in groups:
+            groups["num"] = idx
+        merged = dict(placeholders)
+        merged.update(groups)
+        rendered_name = render_path_template(produce.path, merged)
+        target = (Path(project_root) / rendered_name).resolve()
+        start = m.end()
+        end = matches[idx].start() if idx < len(matches) else len(raw_output)
+        body = (raw_output or "")[start:end].strip()
+        path = _write_text_file(target, body + "\n")
+        written.append(path)
+        segments.append(
+            {
+                "raw_text": body,
+                "matches": groups,
+                "path": path,
+            }
+        )
+    return ProduceParseResult(
+        alias=produce.alias,
+        form="split",
+        paths=written,
+        segments=segments,
+    )
 
 
 __all__ = [
     "OutputForm",
     "ParseResult",
+    "ProduceParseResult",
     "infer_form",
     "parse",
     "render_path_template",

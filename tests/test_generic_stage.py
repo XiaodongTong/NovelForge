@@ -1,27 +1,32 @@
-"""Tests for the v4 :class:`GenericStage`."""
+"""Tests for the v4 contract GenericStage (Phase 3.4).
+
+Covers the transactional execution flow per spec §AC-1/AC-2/AC-3 and the
+attempt_hint injection (AC-17).
+"""
 
 from __future__ import annotations
 
-import json
-from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import pytest
 
-from novelforge.claude.adapter import MockClaudeAdapter, MockResponse
+from novelforge.artifact_registry import ArtifactRegistry
+from novelforge.claude.adapter import (
+    MockClaudeAdapter,
+    MockResponse,
+    StageResult,
+)
 from novelforge.config import (
-    BatchSize,
-    ContextSpec,
-    ExecutionSpec,
+    DoneWhenSpec,
     NovelProjectConfig,
-    NovelSpec,
-    PipelineSpec,
-    RetrySpec,
+    ProduceSpec,
     StageConfig,
 )
-from novelforge.stages import GenericStage, build_v4_stage, is_v4_config
+from novelforge.errors import ConfigError, StageIncomplete, VerifyFailed
 from novelforge.stages.base import StageContext
+from novelforge.stages.generic import GenericStage
+from novelforge.verify import CheckSpec, DEFAULT_COMPLETION_SIGNAL
 
 
 # --------------------------------------------------------------------------- #
@@ -29,375 +34,435 @@ from novelforge.stages.base import StageContext
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture()
-def project_root(tmp_path: Path) -> Path:
-    (tmp_path / "outline").mkdir()
-    (tmp_path / "outline" / "premise.md").write_text(
-        "## Premise\n\nA young cultivator.\n", encoding="utf-8"
+def _min_cfg(tmp_path: Path) -> NovelProjectConfig:
+    """A bare NovelProjectConfig for tests that don't actually load yaml."""
+    from novelforge.config import (
+        BatchSize,
+        ContextSpec,
+        ExecutionSpec,
+        NovelSpec,
+        PipelineSpec,
+        RetrySpec,
     )
-    (tmp_path / "outline" / "world.md").write_text(
-        "## World\n\nThree realms.\n", encoding="utf-8"
-    )
-    (tmp_path / "CLAUDE.md").write_text(
-        "# Rules\n\n- Third person\n", encoding="utf-8"
-    )
-    (tmp_path / "output").mkdir()
-    (tmp_path / "output" / "summaries").mkdir()
-    (tmp_path / "output" / "chapters").mkdir()
-    return tmp_path
 
-
-def _build_cfg(
-    stages: list[StageConfig],
-    *,
-    raw: Optional[dict] = None,
-) -> NovelProjectConfig:
     return NovelProjectConfig(
-        project_path=Path("."),
+        project_path=tmp_path / "novel-project.yaml",
         novel=NovelSpec(
-            title="T",
-            genre="x",
+            title="Test",
+            genre="Test",
             target_chapters=1,
-            words_per_chapter=(800, 1500),
-            style="lean",
-            seeds=("outline/premise.md", "outline/world.md"),
-            constraints=("CLAUDE.md",),
+            words_per_chapter=(100, 200),
+            style="x",
+            seeds=(),
+            constraints=(),
         ),
-        pipeline=PipelineSpec(stages=tuple(stages)),
+        pipeline=PipelineSpec(stages=()),
         execution=ExecutionSpec(
             batch_size=BatchSize(),
-            context=ContextSpec(
-                total=200_000,
-                context_reserve=2000,
-                output_reserve=500,
-                rolling_window=3,
-                outline_range=10,
-            ),
+            context=ContextSpec(),
             retry=RetrySpec(),
             max_review_iterations=3,
-            review_model="claude-sonnet-4-6",
-            write_model="claude-opus-4-7",
-            route_history_max=50,
+            review_model="m",
+            write_model="m",
         ),
-        raw=raw or {},
+    )
+
+
+def _stage(
+    *,
+    id: str = "write_chapter",
+    produces: tuple[ProduceSpec, ...] = (
+        ProduceSpec(path="output/out.md", alias="out"),
+    ),
+    done_when: Optional[DoneWhenSpec] = None,
+    consumes: Optional[tuple[str, ...]] = None,
+    batch: int = 1,
+    prompt: str = "Write a short passage.",
+) -> StageConfig:
+    return StageConfig(
+        id=id,
+        model="mock-model",
+        prompt=prompt,
+        produces=produces,
+        done_when=done_when or DoneWhenSpec(),
+        consumes=consumes,
+        batch=batch,
     )
 
 
 def _ctx(
     cfg: NovelProjectConfig,
     project_root: Path,
-    stage_config: StageConfig,
     *,
-    batch: str = "001",
+    stage: StageConfig,
+    registry: Optional[ArtifactRegistry] = None,
+    batch: Optional[str] = None,
+    attempt: int = 1,
+    last_failure: Optional[Mapping[str, Any]] = None,
 ) -> StageContext:
+    # Note: ArtifactRegistry defines __len__ so an empty instance is
+    # falsy; we must check ``is None`` rather than ``or`` to preserve
+    # the caller's instance.
+    extras: dict[str, Any] = {
+        "stage_config": stage,
+        "registry": registry if registry is not None else ArtifactRegistry(),
+        "attempt": attempt,
+    }
+    if last_failure is not None:
+        extras["last_failure"] = dict(last_failure)
     return StageContext(
         config=cfg,
         project_root=project_root,
-        stage_id=stage_config.id,
+        stage_id=stage.id,
         batch=batch,
-        extras={"stage_config": stage_config},
+        extras=extras,
     )
 
 
 # --------------------------------------------------------------------------- #
-# Construction
+# Happy paths
 # --------------------------------------------------------------------------- #
 
 
-def test_build_v4_stage_returns_singleton() -> None:
-    mock = MockClaudeAdapter()
-    a = build_v4_stage(mock)
-    b = build_v4_stage(mock)
-    assert isinstance(a, GenericStage)
-
-
-# --------------------------------------------------------------------------- #
-# is_v4_config detection
-# --------------------------------------------------------------------------- #
-
-
-def test_is_v4_config_true_with_explicit_stages(project_root: Path) -> None:
-    raw = {
-        "novel": {},
-        "pipeline": {
-            "stages": [
-                {"id": "x", "model": "m", "prompt": "p", "output": "o"}
-            ]
-        },
-    }
-    cfg = _build_cfg(
-        [StageConfig(id="x", model="m", prompt="p", output="o")],
-        raw=raw,
-    )
-    assert is_v4_config(cfg) is True
-
-
-def test_is_v4_config_false_with_template_only(project_root: Path) -> None:
-    raw = {"novel": {}, "pipeline": {"template": "long-epic"}}
-    cfg = _build_cfg([], raw=raw)
-    assert is_v4_config(cfg) is False
-
-
-def test_is_v4_config_false_when_stages_missing(project_root: Path) -> None:
-    raw = {"novel": {}, "pipeline": {"scaffold_from": "long-epic"}}
-    cfg = _build_cfg([], raw=raw)
-    assert is_v4_config(cfg) is False
-
-
-# --------------------------------------------------------------------------- #
-# Execution: text form
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_text_form_writes_raw_output(
-    project_root: Path,
-) -> None:
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="outline",
-                model="m",
-                prompt="make outline",
-                output="output/summaries/outline.md",
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    mock.set_response(
-        "outline",
-        MockResponse(
-            output="# My Outline\n\nstuff\n",
-            input_tokens=10,
-            output_tokens=20,
-        ),
-    )
-    stage = GenericStage(adapter=mock)
-    res = stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    assert res.route == "APPROVED"
-    target = project_root / "output" / "summaries" / "outline.md"
-    assert target.exists()
-    assert "My Outline" in target.read_text(encoding="utf-8")
-
-
-# --------------------------------------------------------------------------- #
-# Execution: JSON form
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_json_form_persists_payload(
-    project_root: Path,
-) -> None:
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="review",
-                model="m",
-                prompt="review it",
-                output="output/review/review.json",
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    mock.set_response(
-        "review",
-        MockResponse(
-            output=json.dumps({"route": "done", "findings": []}),
-            input_tokens=10,
-            output_tokens=20,
-            parsed={"route": "done", "findings": []},
-        ),
-    )
-    stage = GenericStage(adapter=mock)
-    res = stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    assert res.route == "done"
-    target = project_root / "output" / "review" / "review.json"
-    assert target.exists()
-    on_disk = json.loads(target.read_text(encoding="utf-8"))
-    assert on_disk == {"route": "done", "findings": []}
-
-
-# --------------------------------------------------------------------------- #
-# Execution: split form
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_split_form_writes_per_chapter_files(
-    project_root: Path,
-) -> None:
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="write_chapter",
-                model="m",
-                prompt="write chapter",
-                output="output/chapters/{{num:03d}}-{{title|slug}}.md",
-                split=(
-                    r"^#\s+Chapter\s+"
-                    r"(?P<num>\d+)\s*[-–—:]?\s*"
-                    r"(?P<title>.+?)\s*$"
-                ),
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    body = (
-        "# Chapter 1 - The Summons\n\nIt was dark.\n\n"
-        "# Chapter 2 - The Choice\n\nShe hesitated.\n"
-    )
-    mock.set_response(
+def test_single_text_produce_writes_file_and_registers(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    adapter = MockClaudeAdapter()
+    adapter.set_response(
         "write_chapter",
-        MockResponse(output=body, input_tokens=10, output_tokens=20),
-    )
-    stage = GenericStage(adapter=mock)
-    res = stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    assert res.route == "APPROVED"
-    chap_dir = project_root / "output" / "chapters"
-    files = sorted(chap_dir.glob("*.md"))
-    assert len(files) == 2
-    assert files[0].name == "001-the-summons.md"
-    assert files[1].name == "002-the-choice.md"
-
-
-# --------------------------------------------------------------------------- #
-# Execution: disabled stage is a no-op
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_disabled_skips_invoke(project_root: Path) -> None:
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="outline",
-                model="m",
-                prompt="p",
-                output="output/summaries/o.md",
-                enabled=False,
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    stage = GenericStage(adapter=mock)
-    res = stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    # No Claude call was made.
-    assert not mock.calls
-    assert res.route == "SKIPPED"
-    assert res.raw_output == ""
-
-
-# --------------------------------------------------------------------------- #
-# Prompt resolution: file path vs inline
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_prompt_loaded_from_file_when_path_exists(
-    project_root: Path,
-) -> None:
-    prompt_path = project_root / "outline.md"
-    prompt_path.write_text("FILE-PROMPT", encoding="utf-8")
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="outline",
-                model="m",
-                prompt="outline.md",  # no newline → file
-                output="output/summaries/o.md",
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    stage = GenericStage(adapter=mock)
-    stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    # Mock adapter records the prompt that was sent.
-    sent_prompt = mock.calls[0]["prompt"]
-    assert "FILE-PROMPT" in sent_prompt
-
-
-def test_generic_stage_prompt_inline_when_newline(project_root: Path) -> None:
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="outline",
-                model="m",
-                prompt="line1\nline2",  # newline → inline
-                output="output/summaries/o.md",
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    stage = GenericStage(adapter=mock)
-    stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    sent_prompt = mock.calls[0]["prompt"]
-    assert "line1" in sent_prompt
-    assert "line2" in sent_prompt
-
-
-# --------------------------------------------------------------------------- #
-# A9: .json stage with non-JSON model output → SchemaInvalid
-# --------------------------------------------------------------------------- #
-
-
-def test_generic_stage_json_form_rejects_non_json_payload(
-    project_root: Path,
-) -> None:
-    """A9: a `.json` output stage must raise SchemaInvalid when the
-    model returns a non-JSON payload, not silently write raw text."""
-
-    from novelforge.errors import SchemaInvalid
-
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="review",
-                model="m",
-                prompt="review it",
-                output="output/review/review.json",
-            )
-        ]
-    )
-    mock = MockClaudeAdapter()
-    mock.set_response(
-        "review",
         MockResponse(
-            output="totally not json at all",
-            input_tokens=10,
-            output_tokens=20,
-            parsed=None,
+            output="# Title\n\nThe chapter content unfolds with deliberate care. " * 10,
         ),
     )
-    stage = GenericStage(adapter=mock)
-    with pytest.raises(SchemaInvalid, match="review"):
-        stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    # No product file should have been written.
-    assert not (project_root / "output" / "review" / "review.json").exists()
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    result = gen.execute(ctx)
+
+    out = tmp_path / "output" / "out.md"
+    assert out.exists()
+    assert out.read_text(encoding="utf-8").startswith("# Title")
+    assert result.files == [out]
+    assert result.completion_signal is True
+    assert registry.has("write_chapter", "out")
+    assert registry.get_one("write_chapter", "out") == out
 
 
-def test_generic_stage_json_form_accepts_fenced_block(project_root: Path) -> None:
-    """The JSON parser must accept fenced code blocks (mirrors
-    output_parser behaviour)."""
-
-    cfg = _build_cfg(
-        [
-            StageConfig(
-                id="review",
-                model="m",
-                prompt="review it",
-                output="output/review/review.json",
-            )
-        ]
+def test_multiple_produces_writes_each_file(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        id="dual",
+        produces=(
+            ProduceSpec(path="output/a.md", alias="alpha"),
+            ProduceSpec(path="output/b.md", alias="beta"),
+        ),
     )
-    mock = MockClaudeAdapter()
-    payload = {"route": "done", "findings": []}
-    fenced = "Here you go:\n\n```json\n" + json.dumps(payload) + "\n```\n"
-    mock.set_response(
+    body = "# alpha\n\nThe chapter content unfolds with deliberate care. " * 5
+    adapter = MockClaudeAdapter()
+    adapter.set_response("dual", MockResponse(output=body))
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    result = gen.execute(ctx)
+
+    a = tmp_path / "output" / "a.md"
+    b = tmp_path / "output" / "b.md"
+    assert a.exists() and b.exists()
+    # The completion signal is stripped from the file body before write
+    # (output_parser._strip_completion_signal).  Both files contain the
+    # prose body without the trailing signal line.
+    assert a.read_text().startswith("# alpha")
+    assert b.read_text().startswith("# alpha")
+    assert registry.has("dual", "alpha")
+    assert registry.has("dual", "beta")
+    assert len(result.files) == 2
+
+
+def test_json_produce_pretty_prints_payload(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        id="review",
+        produces=(ProduceSpec(path="output/r.json", alias="review"),),
+    )
+    adapter = MockClaudeAdapter()
+    adapter.set_response(
         "review",
-        MockResponse(output=fenced, input_tokens=10, output_tokens=20, parsed=payload),
+        MockResponse(
+            output='{"passed": true, "findings": []}',
+        ),
     )
-    stage = GenericStage(adapter=mock)
-    res = stage.execute(_ctx(cfg, project_root, cfg.pipeline.stages[0]))
-    assert res.route == "done"
-    on_disk = json.loads(
-        (project_root / "output" / "review" / "review.json").read_text(
-            encoding="utf-8"
-        )
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    gen.execute(ctx)
+
+    import json
+    payload = json.loads((tmp_path / "output" / "r.json").read_text())
+    assert payload == {"passed": True, "findings": []}
+
+
+def test_batch_produce_uses_num_placeholder(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        id="batched",
+        produces=(
+            ProduceSpec(path="output/ch-{{num:03d}}.md", alias="chapter"),
+        ),
+        batch=3,
     )
-    assert on_disk == payload
+    adapter = MockClaudeAdapter()
+    adapter.set_response("batched", MockResponse(output="# Section\n\nText body. " * 5))
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(
+        cfg, tmp_path, stage=stage, registry=registry, batch="002"
+    )
+    result = gen.execute(ctx)
+
+    written = tmp_path / "output" / "ch-002.md"
+    assert written.exists(), f"expected ch-002.md in {list((tmp_path / 'output').iterdir())}"
+    assert result.files == [written]
+
+
+def test_split_produce_writes_one_file_per_match(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        id="split",
+        produces=(
+            ProduceSpec(
+                path="output/c-{{num}}-{{title|slug}}.md",
+                alias="chapter",
+                split=r"^# Chapter (?P<num>\d+) - (?P<title>.+?)$",
+            ),
+        ),
+    )
+    body = (
+        "# Chapter 1 - The Beginning\n\nFirst beat.\n\n"
+        "# Chapter 2 - Continuation\n\nSecond beat.\n"
+    )
+    adapter = MockClaudeAdapter()
+    adapter.set_response("split", MockResponse(output=body))
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    result = gen.execute(ctx)
+
+    a = tmp_path / "output" / "c-1-the-beginning.md"
+    b = tmp_path / "output" / "c-2-continuation.md"
+    assert a.exists() and b.exists()
+    assert "First beat." in a.read_text()
+    assert "Second beat." in b.read_text()
+    # split stages register as a list[Path]
+    stored = registry.get_list("split", "chapter")
+    assert set(stored) == {a, b}
+
+
+# --------------------------------------------------------------------------- #
+# First-layer completion-signal check
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_completion_signal_raises_stage_incomplete(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    adapter = MockClaudeAdapter()
+    adapter.set_response(
+        "write_chapter",
+        MockResponse(output="prose without the signal", omit_signal=True),
+    )
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    with pytest.raises(StageIncomplete, match="completion signal"):
+        gen.execute(ctx)
+    # The file must not have been written or registered.
+    assert not (tmp_path / "output" / "out.md").exists()
+    assert not registry.has("write_chapter", "out")
+
+
+def test_completion_signal_disabled_skips_first_layer(tmp_path: Path) -> None:
+    """When done_when.completion_signal is None, the first-layer check
+    is bypassed: a body without any signal still completes the stage."""
+
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(done_when=DoneWhenSpec(completion_signal=None))
+    adapter = MockClaudeAdapter()
+    adapter.set_response(
+        "write_chapter",
+        MockResponse(output="# Hello\n\nno signal anywhere", omit_signal=True),
+    )
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    # Must NOT raise StageIncomplete even though the body has no signal.
+    result = gen.execute(ctx)
+    assert (tmp_path / "output" / "out.md").exists()
+    # detect_completion_signal returns True when the expected marker is
+    # empty; the contract here is "stage succeeded", not "signal detected".
+    assert result.completion_signal is True
+
+
+# --------------------------------------------------------------------------- #
+# Second-layer done_when.checks
+# --------------------------------------------------------------------------- #
+
+
+def test_done_when_failure_raises_verify_failed(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/out.md",
+                    value=10_000,
+                ),
+            ),
+        ),
+    )
+    adapter = MockClaudeAdapter()
+    adapter.set_response("write_chapter", MockResponse(output="short body"))
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    with pytest.raises(VerifyFailed) as excinfo:
+        gen.execute(ctx)
+    err = excinfo.value
+    assert err.kind == "min_chars"
+    assert err.target.endswith("output/out.md")
+    assert err.expected == 10_000
+
+
+def test_done_when_passes_when_check_satisfied(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage(
+        done_when=DoneWhenSpec(
+            checks=(
+                CheckSpec(kind="exists", target="output/out.md"),
+                CheckSpec(
+                    kind="min_chars",
+                    target="output/out.md",
+                    value=10,
+                ),
+            ),
+        ),
+    )
+    adapter = MockClaudeAdapter()
+    adapter.set_response(
+        "write_chapter", MockResponse(output="adequate length content"),
+    )
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    ctx = _ctx(cfg, tmp_path, stage=stage, registry=registry)
+    result = gen.execute(ctx)
+    assert result.files
+
+
+# --------------------------------------------------------------------------- #
+# attempt_hint injection (AC-17)
+# --------------------------------------------------------------------------- #
+
+
+def test_attempt_hint_injected_on_retry(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    adapter = MockClaudeAdapter()
+    adapter.set_response("write_chapter", MockResponse(output="text"))
+    gen = GenericStage(adapter)
+    registry = ArtifactRegistry()
+    last_failure: Mapping[str, Any] = {
+        "type": "VerifyFailed",
+        "detail": "min_chars target=output/out.md expected=1000 actual=12",
+    }
+    ctx = _ctx(
+        cfg,
+        tmp_path,
+        stage=stage,
+        registry=registry,
+        attempt=2,
+        last_failure=last_failure,
+    )
+    gen.execute(ctx)
+    sent_prompt = adapter.calls[0]["prompt"]
+    assert "Attempt: 2" in sent_prompt
+    assert "VerifyFailed" in sent_prompt
+    assert "min_chars" in sent_prompt
+
+
+def test_attempt_hint_absent_on_first_call(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    adapter = MockClaudeAdapter()
+    adapter.set_response("write_chapter", MockResponse(output="text"))
+    gen = GenericStage(adapter)
+    ctx = _ctx(cfg, tmp_path, stage=stage, attempt=1)
+    gen.execute(ctx)
+    assert "Attempt: 1" not in adapter.calls[0]["prompt"]
+
+
+# --------------------------------------------------------------------------- #
+# No-retry invariant
+# --------------------------------------------------------------------------- #
+
+
+def test_generic_stage_does_not_retry_internally(tmp_path: Path) -> None:
+    """A single execute() triggers at most one adapter invoke."""
+
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    adapter = MockClaudeAdapter()
+    adapter.set_response("write_chapter", MockResponse(output="ok content"))
+    gen = GenericStage(adapter)
+    ctx = _ctx(cfg, tmp_path, stage=stage)
+    gen.execute(ctx)
+    assert len(adapter.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Registry propagation
+# --------------------------------------------------------------------------- #
+
+
+def test_disabled_stage_short_circuits(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = StageConfig(
+        id="disabled",
+        model="m",
+        prompt="noop",
+        produces=(ProduceSpec(path="output/x.md", alias="x"),),
+        enabled=False,
+    )
+    adapter = MockClaudeAdapter()
+    gen = GenericStage(adapter)
+    ctx = _ctx(cfg, tmp_path, stage=stage)
+    result = gen.execute(ctx)
+    assert result.files == []
+    assert result.raw_output == ""
+    assert adapter.calls == []
+
+
+def test_missing_stage_config_in_extras_raises(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    ctx = StageContext(
+        config=cfg,
+        project_root=tmp_path,
+        stage_id="x",
+        extras={},
+    )
+    gen = GenericStage(MockClaudeAdapter())
+    with pytest.raises(ConfigError, match="stage_config"):
+        gen.execute(ctx)
+
+
+def test_missing_registry_in_extras_raises(tmp_path: Path) -> None:
+    cfg = _min_cfg(tmp_path)
+    stage = _stage()
+    ctx = StageContext(
+        config=cfg,
+        project_root=tmp_path,
+        stage_id=stage.id,
+        extras={"stage_config": stage},
+    )
+    gen = GenericStage(MockClaudeAdapter())
+    with pytest.raises(ConfigError, match="registry"):
+        gen.execute(ctx)

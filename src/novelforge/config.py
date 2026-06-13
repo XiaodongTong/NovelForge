@@ -1,88 +1,141 @@
 """Configuration layer.
 
-Loads and validates ``novel-project.yaml`` files.  See ``plan.md`` §4.1
-for the contract.  The exported ``NovelProjectConfig`` is a frozen
-dataclass that downstream modules (state, orchestrator, context, …) can
-type-check against.
+Loads and validates ``novel-project.yaml`` files.  The exported
+:class:`NovelProjectConfig` is a frozen dataclass that downstream
+modules (state, orchestrator, context, …) can type-check against.
 
-v4 schema (spec §5.1) introduces :class:`StageConfig` (8 fields,
-frozen) as the canonical per-stage record.  The :class:`PipelineSpec`
-exposes ``stages: tuple[StageConfig, ...]`` for the v4 path while
-keeping ``template`` and ``stages_override`` for backward
-compatibility — both are accepted with a DeprecationWarning, per spec
-§5.5.1.  The v4 path is preferred when ``stages`` is present.
+The stage schema (spec §4.1) is the **contract** model:
+
+- :class:`ProduceSpec` — one of the ``produces[]`` entries (path + alias
+  + optional ``split`` regex).
+- :class:`StageConfig` — the per-stage record with ``id``, ``model``,
+  ``prompt``, ``produces``, ``done_when``, ``consumes``, ``batch``,
+  ``on_failure``, ``enabled``.
+- :class:`CheckSpec` / :class:`DoneWhenSpec` are re-exported from
+  :mod:`novelforge.verify` so the contract types live in one place.
+
+v3 fields (``template``, ``stages_override``, ``scaffold_from``) are no
+longer accepted — :func:`load_config` raises :class:`ConfigError` on
+sight (spec §AC-15).
 """
 
 from __future__ import annotations
 
-import warnings
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
-import re
+from typing import Any, Mapping, Optional, Sequence
 
 import yaml
 
 from .errors import ConfigError, SchemaInvalid
-from .claude.output_parser import infer_form
 from .utils.log import get_logger as _get_logger
+from .verify import CheckSpec, DoneWhenSpec  # re-exported below
 
 _log = _get_logger("config")
 
 # --------------------------------------------------------------------------- #
-# Built-in pipeline templates.
+# Constants
 # --------------------------------------------------------------------------- #
-
-# Re-exported from ``templates`` so legacy import sites that pulled
-# ``PIPELINE_TEMPLATES`` from this module keep working.  The data
-# itself lives in :mod:`novelforge.templates` (T01, T02) and is the
-# v4 source of truth.
-from .templates import (
-    PIPELINE_TEMPLATES as _PIPELINE_TEMPLATES,
-    VALID_TEMPLATES,
-    get_template as _get_template,
-)
-
-PIPELINE_TEMPLATES: dict[str, tuple[str, ...]] = {
-    name: tuple(stages) for name, stages in _PIPELINE_TEMPLATES.items()
-}
-
-
-# --------------------------------------------------------------------------- #
-# v4 stage schema (8 fields)
-# --------------------------------------------------------------------------- #
-
 
 _ON_FAILURE_VALUES = frozenset({"pause", "skip", "fail"})
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)(?::[^}|]+)?(?:\|[^}|]+)?\s*\}\}")
+
+
+# --------------------------------------------------------------------------- #
+# ProduceSpec
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ProduceSpec:
+    """One ``produces[]`` entry (spec §4.1).
+
+    A produce is a single output file (or, when ``split`` is set, a
+    single regex-driven multi-file artefact).  Each produce is bound to
+    a unique ``alias`` so downstream stages can reference it via
+    ``{{upstream.<id>.<alias>}}``.
+    """
+
+    path: str
+    alias: str
+    split: Optional[str] = None
+    form: str = "text"  # "text" | "json" — set by validate_path_form
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ConfigError(
+                "produces[].path must be a non-empty string"
+            )
+        if not isinstance(self.alias, str) or not self.alias.strip():
+            raise ConfigError(
+                "produces[].alias must be a non-empty string"
+            )
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.alias):
+            raise ConfigError(
+                f"produces[].alias {self.alias!r} must be a valid identifier "
+                f"(letters, digits, underscore; no leading digit)"
+            )
+        if self.split is not None:
+            if not isinstance(self.split, str) or not self.split.strip():
+                raise ConfigError(
+                    f"produces[].split for alias {self.alias!r} must be a "
+                    f"non-empty regex when present"
+                )
+        if self.form not in {"text", "json"}:
+            raise ConfigError(
+                f"produces[].form must be 'text' or 'json'; got {self.form!r}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"path": self.path, "alias": self.alias}
+        if self.split:
+            d["split"] = self.split
+        return d
+
+
+# --------------------------------------------------------------------------- #
+# StageConfig
+# --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
 class StageConfig:
-    """A single stage in a v4 pipeline (8 fields, frozen).
+    """A single stage in the contract pipeline.
 
-    Field order mirrors spec §5.1 so the dataclass render is also the
-    canonical yaml render order.  Defaults are applied for the three
-    truly optional fields (``batch``, ``on_failure``, ``enabled``).
+    Fields (spec §4.1):
+
+    - ``id`` / ``model`` / ``prompt`` — identity + how to invoke.
+    - ``produces`` — list of :class:`ProduceSpec` (≥ 1 required).
+    - ``done_when`` — :class:`DoneWhenSpec` (defaults applied when None).
+    - ``consumes`` — :class:`ConsumesSpec` describing upstream binding
+      (default = all upstream stages).
+    - ``batch`` — N when the stage runs N times in a ``{{num}}`` loop.
+    - ``on_failure`` — pause / skip / fail when ``max_attempts`` exhausts.
+    - ``enabled`` — false to skip wholesale.
     """
 
     id: str
     model: str
     prompt: str
-    output: str
-    split: Optional[str] = None
+    produces: tuple[ProduceSpec, ...]
+    done_when: DoneWhenSpec = field(default_factory=DoneWhenSpec)
+    consumes: Optional[tuple[str, ...]] = None
     batch: int = 1
     on_failure: str = "pause"
     enabled: bool = True
 
-    def __post_init__(self) -> None:  # pragma: no cover - dataclass hook
-        # frozen dataclass: tolerate AttributeError on uninitialised
-        # fields by checking first.
-        for fname in ("id", "model", "prompt", "output"):
+    def __post_init__(self) -> None:
+        for fname in ("id", "model", "prompt"):
             v = getattr(self, fname, None)
             if not isinstance(v, str) or not v.strip():
                 raise ConfigError(
                     f"stage field {fname!r} must be a non-empty string"
                 )
+        if not self.produces:
+            raise ConfigError(
+                f"stage {self.id!r}: 'produces' must be a non-empty list"
+            )
         if not isinstance(self.batch, int) or isinstance(self.batch, bool):
             raise ConfigError(
                 f"stage {self.id!r}: 'batch' must be a positive integer"
@@ -96,16 +149,38 @@ class StageConfig:
                 f"stage {self.id!r}: 'on_failure' must be one of "
                 f"{sorted(_ON_FAILURE_VALUES)} (got {self.on_failure!r})"
             )
+        # Alias uniqueness within a stage (AC-16).
+        seen_alias: set[str] = set()
+        for p in self.produces:
+            if p.alias in seen_alias:
+                raise ConfigError(
+                    f"stage {self.id!r}: duplicate produces alias "
+                    f"{p.alias!r} (alias must be unique within a stage)"
+                )
+            seen_alias.add(p.alias)
+        # consumes: tuple[str, ...] | None (None = all upstreams) | () (none)
+        if self.consumes is not None:
+            for cid in self.consumes:
+                if not isinstance(cid, str) or not cid.strip():
+                    raise ConfigError(
+                        f"stage {self.id!r}: 'consumes' entries must be "
+                        f"non-empty strings"
+                    )
+
+    @property
+    def is_batch(self) -> bool:
+        return self.batch > 1
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,
             "model": self.model,
             "prompt": self.prompt,
-            "output": self.output,
+            "produces": [p.to_dict() for p in self.produces],
+            "done_when": self.done_when.to_dict(),
         }
-        if self.split:
-            d["split"] = self.split
+        if self.consumes is not None:
+            d["consumes"] = list(self.consumes)
         if self.batch != 1:
             d["batch"] = self.batch
         if self.on_failure != "pause":
@@ -115,50 +190,110 @@ class StageConfig:
         return d
 
 
-def validate_stage(stage: StageConfig) -> list[str]:
-    """Return a list of validation errors for ``stage`` (empty = OK).
+# --------------------------------------------------------------------------- #
+# ProduceSpec / StageConfig validation
+# --------------------------------------------------------------------------- #
 
-    The :class:`StageConfig` constructor already enforces the type and
-    presence of every required field.  This function covers the
-    inter-field constraints that can't be expressed by ``__post_init__``
-    without re-validating the output template form.
+
+def _placeholders_in(path: str) -> set[str]:
+    """Return the set of ``{{name}}`` placeholders in ``path``."""
+
+    return {m for m in _PLACEHOLDER_RE.findall(path)}
+
+
+def _validate_produce_spec(
+    produce: ProduceSpec,
+    *,
+    stage_id: str,
+    is_batch: bool,
+) -> list[str]:
+    """Inter-field validation that can't fit in __post_init__.
+
+    Returns a list of error strings (empty = OK).
     """
 
     errors: list[str] = []
-    # Form inference (A15: .json + {{x}} illegal).
-    try:
-        form = infer_form(stage.output)
-    except ValueError as exc:
+    has_split = produce.split is not None
+    placeholders = _placeholders_in(produce.path)
+    ends_json = produce.path.rstrip().endswith(".json")
+
+    # AC-16: batch + split mutually exclusive.
+    if is_batch and has_split:
         errors.append(
-            f"stage {stage.id!r}: output template is invalid: {exc}"
+            f"stage {stage_id!r}: produces alias {produce.alias!r} cannot "
+            f"combine `batch` with `split` (v1 — choose one mechanism)"
         )
-        return errors
-    if form == "split" and not stage.split:
-        errors.append(
-            f"stage {stage.id!r}: output contains placeholders but `split` "
-            f"is missing — set `split` to a regex with a named `num` "
-            f"capture group (A10)"
-        )
-    if stage.split:
-        # Every {{var}} in the template must have a matching (?P<var>...)
-        # capture group in the split regex, and vice versa.
+
+    if has_split:
+        # split mode: path must use {{name}} placeholders, and every
+        # placeholder must correspond to a named capture group in the
+        # split regex.
+        if not placeholders:
+            errors.append(
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"has `split` set but path has no {{name}} placeholders"
+            )
         try:
-            regex = re.compile(stage.split)
+            regex = re.compile(produce.split or "")
         except re.error as exc:
             errors.append(
-                f"stage {stage.id!r}: 'split' regex is invalid: {exc}"
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"`split` regex is invalid: {exc}"
             )
         else:
             named = set(regex.groupindex.keys())
-            placeholders = set(
-                re.findall(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)", stage.output)
-            )
             missing_in_regex = placeholders - named
+            missing_in_path = named - placeholders
             if missing_in_regex:
                 errors.append(
-                    f"stage {stage.id!r}: output placeholders {sorted(missing_in_regex)} "
-                    f"have no matching (?P<name>...) capture in `split`"
+                    f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                    f"path placeholders {sorted(missing_in_regex)} have no "
+                    f"matching (?P<name>...) capture in `split`"
                 )
+            if missing_in_path:
+                errors.append(
+                    f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                    f"`split` capture groups {sorted(missing_in_path)} are "
+                    f"not used in path"
+                )
+        if ends_json:
+            errors.append(
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"`split` is incompatible with `.json` suffix"
+            )
+    elif is_batch:
+        # batch mode: path must use {{num}}.
+        if "num" not in placeholders:
+            errors.append(
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"requires a {{{{num}}}} placeholder when `batch > 1`"
+            )
+        extra = placeholders - {"num"}
+        if extra:
+            errors.append(
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"uses placeholders {sorted(extra)} but only {{{{num}}}} "
+                f"is valid for batch produces"
+            )
+    else:
+        # single mode: path should not have placeholders.
+        if placeholders:
+            errors.append(
+                f"stage {stage_id!r}: produces alias {produce.alias!r} "
+                f"path has placeholders {sorted(placeholders)} but neither "
+                f"`split` nor `batch > 1` is set"
+            )
+    return errors
+
+
+def validate_stage(stage: StageConfig) -> list[str]:
+    """Return a list of validation errors for ``stage`` (empty = OK)."""
+
+    errors: list[str] = []
+    for p in stage.produces:
+        errors.extend(
+            _validate_produce_spec(p, stage_id=stage.id, is_batch=stage.is_batch)
+        )
     if not stage.prompt.strip():
         errors.append(
             f"stage {stage.id!r}: 'prompt' is required (no built-in fallback)"
@@ -166,8 +301,28 @@ def validate_stage(stage: StageConfig) -> list[str]:
     return errors
 
 
+def _validate_alias_uniqueness_across_stages(
+    stages: Sequence[StageConfig],
+) -> list[str]:
+    """AC-18: every produces[].alias must be unique within the pipeline."""
+
+    errors: list[str] = []
+    seen: dict[str, str] = {}  # alias → first owning stage_id
+    for s in stages:
+        for p in s.produces:
+            if p.alias in seen:
+                errors.append(
+                    f"produces[].alias {p.alias!r} is declared by both "
+                    f"stage {seen[p.alias]!r} and stage {s.id!r}; cross-stage "
+                    f"alias overlap is forbidden (AC-18)"
+                )
+            else:
+                seen[p.alias] = s.id
+    return errors
+
+
 # --------------------------------------------------------------------------- #
-# Dataclasses
+# Section dataclasses
 # --------------------------------------------------------------------------- #
 
 
@@ -191,19 +346,10 @@ class NovelSpec:
 class PipelineSpec:
     """The ``pipeline:`` section.
 
-    v4 promotes ``stages: tuple[StageConfig, ...]`` to the canonical
-    runtime data source.  The v3 fields (``template``,
-    ``stages_override``) are still accepted for backward compatibility
-    but are normalised to ``stages`` during :func:`load_config`, and
-    the orchestrator will emit a DeprecationWarning for each field
-    present.  ``scaffold_from`` is a pure metadata field — the
-    runtime never reads it (A16).
+    Only the v4 ``stages: tuple[StageConfig, ...]`` form is supported.
     """
 
-    template: Optional[str] = None
     stages: tuple[StageConfig, ...] = ()
-    stages_override: Optional[tuple[str, ...]] = None
-    scaffold_from: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -248,8 +394,6 @@ class ExecutionSpec:
     max_review_iterations: int
     review_model: str
     write_model: str
-    # v4-only:
-    route_history_max: int = 50
 
 
 @dataclass(frozen=True)
@@ -348,12 +492,104 @@ def _parse_novel(raw: Mapping[str, Any]) -> NovelSpec:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Parsing helpers for the new contract fields
+# --------------------------------------------------------------------------- #
+
+
+def _parse_check(raw: Mapping[str, Any], *, position: int) -> CheckSpec:
+    if not isinstance(raw, Mapping):
+        raise SchemaInvalid(
+            f"done_when.checks[{position}] must be a mapping"
+        )
+    kind = str(raw.get("kind", "")).strip()
+    target = str(raw.get("target", "")).strip()
+    if not kind or not target:
+        raise SchemaInvalid(
+            f"done_when.checks[{position}]: 'kind' and 'target' are required"
+        )
+    return CheckSpec(
+        kind=kind,
+        target=target,
+        value=raw.get("value"),
+        field=raw.get("field"),
+        pattern=raw.get("pattern"),
+        callable=raw.get("callable"),
+    )
+
+
+def _parse_done_when(raw: Any) -> DoneWhenSpec:
+    if raw is None:
+        return DoneWhenSpec()
+    if not isinstance(raw, Mapping):
+        raise SchemaInvalid("done_when must be a mapping or null")
+    completion_signal = raw.get("completion_signal", None)
+    # An explicit null is allowed (AC-11); a missing key defaults to the
+    # standard marker.  Distinguish by checking key presence.
+    if "completion_signal" in raw:
+        cs_value = raw["completion_signal"]
+        if cs_value is None:
+            completion_signal = None
+        elif isinstance(cs_value, str):
+            completion_signal = cs_value
+        else:
+            raise SchemaInvalid(
+                "done_when.completion_signal must be a string or null"
+            )
+    else:
+        completion_signal = DoneWhenSpec().completion_signal
+
+    raw_checks = raw.get("checks") or []
+    if not isinstance(raw_checks, list):
+        raise SchemaInvalid("done_when.checks must be a list")
+    checks = tuple(_parse_check(c, position=i) for i, c in enumerate(raw_checks))
+
+    max_attempts = raw.get("max_attempts", DoneWhenSpec().max_attempts)
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+        raise SchemaInvalid(
+            "done_when.max_attempts must be a positive integer"
+        )
+    mode = str(raw.get("mode", "all"))
+    if mode not in {"all", "any"}:
+        raise SchemaInvalid(
+            f"done_when.mode must be 'all' or 'any'; got {mode!r}"
+        )
+    return DoneWhenSpec(
+        completion_signal=completion_signal,
+        checks=checks,
+        max_attempts=max_attempts,
+        mode=mode,
+    )
+
+
+def _parse_produce(raw: Any, *, position: int) -> ProduceSpec:
+    if not isinstance(raw, Mapping):
+        raise SchemaInvalid(
+            f"produces[{position}] must be a mapping"
+        )
+    path = str(raw.get("path", "")).strip()
+    alias = str(raw.get("alias", "")).strip()
+    if not path or not alias:
+        raise SchemaInvalid(
+            f"produces[{position}]: 'path' and 'alias' are required"
+        )
+    split = raw.get("split")
+    if split is not None:
+        if not isinstance(split, str):
+            raise SchemaInvalid(
+                f"produces[{position}].split must be a string regex"
+            )
+        split = split.strip() or None
+    form = "json" if path.rstrip().endswith(".json") else "text"
+    return ProduceSpec(path=path, alias=alias, split=split, form=form)
+
+
 def _parse_stage_config(
     raw: Mapping[str, Any],
     *,
     position: int,
 ) -> StageConfig:
-    """Parse one ``pipeline.stages[i]`` record (spec §5.1)."""
+    """Parse one ``pipeline.stages[i]`` record (contract model)."""
 
     if not isinstance(raw, Mapping):
         raise SchemaInvalid(
@@ -381,17 +617,37 @@ def _parse_stage_config(
             f"stage {stage_id!r} (pipeline.stages[{position}]): "
             f"'prompt' is required (no built-in fallback)"
         )
-    output = str(raw.get("output", "")).strip()
-    if not output:
+
+    raw_produces = raw.get("produces")
+    if raw_produces is None or not isinstance(raw_produces, list) or not raw_produces:
         raise SchemaInvalid(
-            f"stage {stage_id!r} (pipeline.stages[{position}]): "
-            f"'output' is required"
+            f"stage {stage_id!r}: 'produces' must be a non-empty list"
         )
-    split = raw.get("split")
-    if split is not None and not isinstance(split, str):
+    produces = tuple(
+        _parse_produce(p, position=i) for i, p in enumerate(raw_produces)
+    )
+
+    done_when = _parse_done_when(raw.get("done_when"))
+
+    consumes_raw = raw.get("consumes", "missing")
+    consumes: Optional[tuple[str, ...]]
+    if consumes_raw == "missing" or consumes_raw is None:
+        consumes = None  # default: all upstreams
+    elif isinstance(consumes_raw, list):
+        # Explicit list, including empty list ("no upstreams").
+        cleaned: list[str] = []
+        for c in consumes_raw:
+            if not isinstance(c, str) or not c.strip():
+                raise SchemaInvalid(
+                    f"stage {stage_id!r}: 'consumes' entries must be non-empty strings"
+                )
+            cleaned.append(c.strip())
+        consumes = tuple(cleaned)
+    else:
         raise SchemaInvalid(
-            f"stage {stage_id!r}: 'split' must be a string regex"
+            f"stage {stage_id!r}: 'consumes' must be a list or null"
         )
+
     batch = raw.get("batch", 1)
     if not isinstance(batch, int) or isinstance(batch, bool) or batch < 1:
         raise SchemaInvalid(
@@ -408,84 +664,55 @@ def _parse_stage_config(
         id=stage_id,
         model=model,
         prompt=prompt,
-        output=output,
-        split=split,
+        produces=produces,
+        done_when=done_when,
+        consumes=consumes,
         batch=batch,
         on_failure=on_failure,
         enabled=enabled,
     )
 
 
-def _parse_pipeline(raw: Mapping[str, Any]) -> PipelineSpec:
-    """Parse the ``pipeline:`` section.
+# --------------------------------------------------------------------------- #
+# Pipeline section
+# --------------------------------------------------------------------------- #
 
-    Returns a fully-resolved :class:`PipelineSpec` where ``stages`` is
-    always a tuple of :class:`StageConfig`.  The v3 fields
-    (``template`` / ``stages_override``) are honoured for back-compat
-    and translated into a synthetic ``stages`` list (one per stage id
-    in the resolved template + override), defaulting each
-    :class:`StageConfig` field from the built-in
-    :mod:`novelforge.templates` record.
-    """
+
+# v3 fields that must be rejected on sight (AC-15 / spec §AC-15).
+_V3_DEPRECATED_FIELDS = ("template", "stages_override", "scaffold_from")
+
+
+def _parse_pipeline(raw: Mapping[str, Any]) -> PipelineSpec:
+    """Parse the ``pipeline:`` section (v4-only)."""
 
     section = raw.get("pipeline") or {}
     if not isinstance(section, Mapping):
         raise ConfigError("section pipeline must be a mapping")
 
-    # scaffold_from: pure metadata, never validated
-    scaffold_from_raw = section.get("scaffold_from")
-    scaffold_from: Optional[str] = None
-    if scaffold_from_raw is not None:
-        if not isinstance(scaffold_from_raw, str):
+    # AC-15: reject any v3 field on sight.
+    for v3_field in _V3_DEPRECATED_FIELDS:
+        if v3_field in section:
             raise ConfigError(
-                "field pipeline.scaffold_from must be a string (metadata only; "
-                "runtime ignores any value, including unknown template names)"
+                f"field pipeline.{v3_field} is no longer supported; "
+                f"use pipeline.stages: [...] (see docs/plan/stage-contract.md)"
             )
-        scaffold_from = scaffold_from_raw
 
     explicit_stages = section.get("stages")
-    has_explicit = explicit_stages is not None
-    if has_explicit:
-        if not isinstance(explicit_stages, list) or not explicit_stages:
-            raise SchemaInvalid(
-                "field pipeline.stages must be a non-empty list of stage mappings"
-            )
-        stages_tuple = tuple(
-            _parse_stage_config(s, position=i)
-            for i, s in enumerate(explicit_stages)
+    if explicit_stages is None:
+        raise ConfigError(
+            "field pipeline.stages is required (v3 template / stages_override "
+            "are no longer supported)"
         )
-    else:
-        stages_tuple = ()
+    if not isinstance(explicit_stages, list) or not explicit_stages:
+        raise SchemaInvalid(
+            "field pipeline.stages must be a non-empty list of stage mappings"
+        )
+    stages_tuple = tuple(
+        _parse_stage_config(s, position=i)
+        for i, s in enumerate(explicit_stages)
+    )
 
-    # v3 fallback: template + stages_override
-    template: Optional[str] = None
-    stages_override: Optional[tuple[str, ...]] = None
-
-    if not has_explicit:
-        template_raw = section.get("template", "long-epic")
-        if not isinstance(template_raw, str):
-            raise ConfigError("field pipeline.template must be a string")
-        if template_raw not in VALID_TEMPLATES:
-            raise ConfigError(
-                f"unknown pipeline.template {template_raw!r}; "
-                f"expected one of: {sorted(VALID_TEMPLATES)}"
-            )
-        template = template_raw
-        override_raw = section.get("stages_override")
-        if override_raw is None:
-            stage_ids: tuple[str, ...] = PIPELINE_TEMPLATES[template]
-        else:
-            if not isinstance(override_raw, (list, tuple)) or not override_raw:
-                raise ConfigError(
-                    "field pipeline.stages_override must be a non-empty list of stage ids"
-                )
-            stage_ids = tuple(str(s) for s in override_raw)
-            if len(set(stage_ids)) != len(stage_ids):
-                raise ConfigError("pipeline.stages_override contains duplicates")
-            stages_override = stage_ids
-        stages_tuple = tuple(_synthesize_stage_configs(stage_ids))
-
-    # Cross-record validation
+    # Cross-record validation.
     seen: set[str] = set()
     for s in stages_tuple:
         if s.id in seen:
@@ -495,45 +722,11 @@ def _parse_pipeline(raw: Mapping[str, Any]) -> PipelineSpec:
         seen.add(s.id)
         for err in validate_stage(s):
             raise SchemaInvalid(err)
+    # Cross-stage alias uniqueness (AC-18).
+    for err in _validate_alias_uniqueness_across_stages(stages_tuple):
+        raise SchemaInvalid(err)
 
-    return PipelineSpec(
-        template=template,
-        stages=stages_tuple,
-        stages_override=stages_override,
-        scaffold_from=scaffold_from,
-    )
-
-
-def _synthesize_stage_configs(stage_ids: Sequence[str]) -> Iterable[StageConfig]:
-    """Build a synthetic list of :class:`StageConfig` from built-in templates.
-
-    Used when a user supplies only ``template:``/``stages_override:``
-    in their yaml.  Each stage pulls its 8 fields from
-    :func:`novelforge.templates.get_template` so the engine can run
-    with a single :class:`GenericStage` code path (T14).
-    """
-
-    for sid in stage_ids:
-        try:
-            tpl = _get_template(sid)
-        except KeyError as exc:
-            raise ConfigError(
-                f"pipeline references unknown stage id {sid!r}; "
-                f"known: {sorted(_ALL_STAGE_IDS)}"
-            ) from exc
-        yield StageConfig(
-            id=tpl.id,
-            model=tpl.model,
-            prompt=tpl.prompt_text,
-            output=tpl.output,
-            split=tpl.split,
-            batch=tpl.batch,
-            on_failure=tpl.on_failure,
-            enabled=tpl.enabled,
-        )
-
-
-from .templates import ALL_STAGE_IDS as _ALL_STAGE_IDS
+    return PipelineSpec(stages=stages_tuple)
 
 
 def _parse_execution(raw: Mapping[str, Any]) -> ExecutionSpec:
@@ -614,11 +807,6 @@ def _parse_execution(raw: Mapping[str, Any]) -> ExecutionSpec:
         section.get("write_model", "claude-opus-4-7"),
         "execution.write_model",
     )
-    route_history_max = _as_int(
-        section.get("route_history_max", 50),
-        "execution.route_history_max",
-        min_value=1,
-    )
     return ExecutionSpec(
         batch_size=batch_size,
         context=context,
@@ -626,7 +814,6 @@ def _parse_execution(raw: Mapping[str, Any]) -> ExecutionSpec:
         max_review_iterations=max_review,
         review_model=review_model,
         write_model=write_model,
-        route_history_max=route_history_max,
     )
 
 
@@ -637,14 +824,7 @@ def _resolve_project_root(path: Path) -> Path:
 
 
 def _check_seed_files(novel: NovelSpec, project_root: Path) -> None:
-    """Log a warning for any missing seed / constraint file.
-
-    Per spec §4.1 and A13: ``init`` only materialises the yaml +
-    ``prompts/``; ``outline/`` and ``CLAUDE.md`` are user-supplied.
-    Validate must therefore pass without them — missing files surface
-    at runtime on the first ``{{include:}}`` stage and are handled
-    via that stage's ``on_failure`` disposition (default ``pause``).
-    """
+    """Log a warning for any missing seed / constraint file."""
 
     for rel in novel.seeds:
         candidate = (project_root / rel).resolve()
@@ -668,9 +848,9 @@ def load_config(path: Path) -> NovelProjectConfig:
     """Load and validate a novel-project.yaml file.
 
     Raises:
-        ConfigError: when the file is missing, unparseable, or fails
-            any validation rule.  Also :class:`SchemaInvalid` (a
-            subclass) for v4 stage-record errors.
+        ConfigError: when the file is missing, unparseable, contains a
+            v3-only field, or fails any validation rule.  Also
+            :class:`SchemaInvalid` (a subclass) for stage-record errors.
     """
 
     path = Path(path)
@@ -689,10 +869,6 @@ def load_config(path: Path) -> NovelProjectConfig:
     project_root = _resolve_project_root(path)
     _check_seed_files(novel, project_root)
 
-    # Deprecation messages for v3 fields are emitted at *runtime* (see
-    # ``deprecation_warnings_for``) so they reach the run log without
-    # breaking test suites that treat DeprecationWarning as an error.
-
     return NovelProjectConfig(
         project_path=path,
         novel=novel,
@@ -700,42 +876,6 @@ def load_config(path: Path) -> NovelProjectConfig:
         execution=execution,
         raw=dict(raw_obj),
     )
-
-
-def _explicit_stages_present(raw: Mapping[str, Any]) -> bool:
-    section = raw.get("pipeline")
-    if not isinstance(section, Mapping):
-        return False
-    return section.get("stages") is not None
-
-
-def deprecation_warnings_for(cfg: NovelProjectConfig) -> list[str]:
-    """Return the list of deprecation messages implied by ``cfg``.
-
-    Used by the orchestrator / CLI at *runtime* (not at load time) so
-    the warnings reach the run log without breaking test suites that
-    treat :class:`DeprecationWarning` as an error.  One message per
-    deprecated v3 field present in the source yaml (A1 / spec §10).
-    """
-
-    messages: list[str] = []
-    section = cfg.raw.get("pipeline") if cfg.raw else None
-    if isinstance(section, Mapping):
-        if (
-            "template" in section
-            and section.get("stages") is None
-        ):
-            messages.append(
-                "pipeline.template is deprecated; use pipeline.stages (v4) "
-                "instead.  See spec §5.5.1."
-            )
-        if section.get("stages_override") is not None:
-            messages.append(
-                "pipeline.stages_override is deprecated and ignored at "
-                "runtime; merge its values into pipeline.stages instead.  "
-                "See spec §5.5.1."
-            )
-    return messages
 
 
 def with_max_chapters(cfg: NovelProjectConfig, max_chapters: int) -> NovelProjectConfig:
@@ -750,13 +890,7 @@ def with_max_chapters(cfg: NovelProjectConfig, max_chapters: int) -> NovelProjec
 
 
 def stages_for(cfg: NovelProjectConfig) -> Sequence[StageConfig]:
-    """Return the resolved stage list for a config.
-
-    Always reflects the runtime stage list.  v4 ``pipeline.stages`` is
-    used when present; otherwise ``pipeline.stages_override`` falls
-    back to ``pipeline.template`` (with DeprecationWarning emitted at
-    load time).
-    """
+    """Return the resolved stage list for a config."""
 
     return list(cfg.pipeline.stages)
 
@@ -768,8 +902,9 @@ def stage_ids_for(cfg: NovelProjectConfig) -> Sequence[str]:
 
 
 __all__ = [
-    "PIPELINE_TEMPLATES",
-    "VALID_TEMPLATES",
+    "CheckSpec",
+    "DoneWhenSpec",
+    "ProduceSpec",
     "StageConfig",
     "validate_stage",
     "NovelSpec",
