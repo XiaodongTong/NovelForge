@@ -1,5 +1,9 @@
 # NovelForge — AI 无人值守小说创作引擎 设计方案
 
+> **状态**：本文件是早期 v3 阶段的架构愿景与模块设计。当前运行时模型已升级到 **v4**（统一 `pipeline.stages` 8 字段 + `GenericStage`）；用户/贡献者编写 `novel-project.yaml` 与阅读 stage schema 时，请以 [`pipeline-customization.md`](./pipeline-customization.md) 为准。
+>
+> 本文件保留作为架构愿景与模块布局参考；其中的 yaml / stage / review 示例属 v3 形态，**不应**直接复制到 v4 配置里。
+
 ## 一、系统定位
 
 一个**声明式、可配置、无人值守**的 AI 长篇小说创作引擎。用户只需提供故事种子（前提、世界观、风格要求），引擎自动完成从大纲到成稿的全流程，产出 300 章、80 万字级别的完整长篇小说。
@@ -228,8 +232,7 @@ review_dimensions:
 │   ├── pipeline.log        # 流水线执行日志
 │   ├── token-usage.log     # Token 用量追踪
 │   └── errors.log          # 错误日志
-└── metrics/
-    └── quality-scores.json # 各章节审查评分
+└── metrics/                # 预留：质量指标（阶段一未自动写入）
 ```
 
 ```yaml

@@ -1,0 +1,22 @@
+novel:
+  title: "Sample Novel"
+  genre: "玄幻修仙"
+  target_chapters: 1
+  words_per_chapter: [800, 1500]
+  style: "sample, short"
+  seeds:
+    - outline/premise.md
+    - outline/world.md
+  constraints:
+    - CLAUDE.md
+
+pipeline:
+  template: "long-epic"
+
+execution:
+  batch_size:
+    outline: 50
+    chapter: 1
+  max_review_iterations: 3
+  review_model: "claude-sonnet-4-6"
+  write_model: "claude-opus-4-7"

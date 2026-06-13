@@ -1,0 +1,348 @@
+# For guidance on editing this file, run: `cybervisor docs cybervisor.yaml`
+stages:
+  - name: Design Delivery
+    prompt_template: |
+      Act as the product lead, technical lead, and delivery lead for this repository.
+
+      ## Objective
+
+      Produce the working delivery documents for this request:
+
+      {objective}
+
+      ## Artifacts
+
+      Write all four canonical artifacts for downstream stages:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+
+      ## Document Responsibilities
+
+      - treat `.cybervisor/artifacts/spec.md` as the canonical product specification
+      - treat `.cybervisor/artifacts/plan.md` as the canonical implementation plan
+      - treat `.cybervisor/artifacts/tasks.md` as the canonical execution checklist
+      - treat `.cybervisor/artifacts/verify.md` as the canonical manual verification guide
+      - clearly describe what is being built, who it serves, why it matters, and how success is judged
+      - define the user problem, expected workflow, acceptance criteria, and notable product or UX risks in the specification
+      - define the architecture, major technical decisions, sequencing, validation strategy, integration points, and notable delivery risks in the plan
+      - produce a clear, ordered checklist-style task breakdown that covers implementation, testing, and verification work
+      - if the project is not fully initialized yet, include the required stack, scaffold, dependency, config, and first-run setup guidance in the plan and tasks
+      - make the tasks specific enough to be completed and checked off independently during implementation
+
+      ## Verification Guide
+
+      - in `.cybervisor/artifacts/verify.md`, write a step-by-step manual verification guide that a human reviewer can follow to confirm the implementation works as intended; include prerequisites, setup steps, each verification scenario with expected results, and how to clean up or roll back after testing; focus on user-visible behavior and acceptance criteria from the specification, not on code-level checks
+
+      ## Quality
+
+      - keep the four artifacts consistent with one another
+      - keep all four artifacts concise and token-efficient, especially `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md`
+      - do not include specific code implementations, snippets, or blocks; focus on requirements, architecture, and actionable work planning to save tokens
+      - proactively use web search when unsure about existing solutions, library capabilities, API patterns, or best practices; research before committing to a design decision rather than guessing
+      - evaluate whether the proposed product scope, technical design, and task ordering represent the most practical path to a successful implementation
+    cleanup:
+      - .cybervisor/artifacts
+      - .cybervisor/backups
+      - .cybervisor/logs/stages
+      - .tmp
+    read_only_paths:
+      - "src/**"
+      - "tests/**"
+    max_retries: 3
+    next_stage: Review Delivery Docs
+
+  - name: Review Delivery Docs
+    prompt_template: |
+      Perform a senior cross-functional review of the current delivery documents.
+
+      ## Objective
+
+      Review delivery documents for:
+
+      {objective}
+
+      ## Context
+
+      - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` as the canonical planning context
+      - if any artifact is missing or the document set does not contain a relevant specification, implementation plan, execution-ready task breakdown, and manual verification guide for the objective, use `NO_RELEVANT_ARTIFACTS` status
+
+      ## Review Scope
+
+      - review the four artifacts together for product clarity, technical soundness, execution order, testing coverage, verification coverage, and consistency
+      - inspect scope, assumptions, acceptance criteria, architecture, sequencing, dependencies, risks, and implementation safety
+
+      ## Refinements
+
+      - if refinements are needed, edit `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` directly before finishing this stage
+      - do not rewrite healthy sections unnecessarily; preserve stable content and make the smallest edits needed
+      - keep refinements focused on clarity, consistency, sequencing, validation coverage, dependency handling, and readiness for autonomous implementation
+      - allowed edits in this stage are limited to product clarity fixes, architecture and sequencing corrections, task breakdown improvements, missing validation work, and objective alignment
+      - do not include specific code implementations, snippets, or blocks in the artifacts; focus on requirements, architecture, and actionable planning to save tokens
+      - keep the review output actionable and specific
+    contract:
+      fields:
+        Findings:
+          description: Specific cross-document issues discovered during review.
+          example: |
+            - The acceptance criteria do not cover the failure and recovery paths.
+            - The task breakdown skips migration work required by the implementation plan.
+        Required Changes:
+          description: Concrete document updates required before implementation can begin safely.
+          example: |
+            - Add acceptance criteria for failure handling and recovery.
+            - Add ordered tasks for the required migration and regression coverage.
+        Objective Mismatch:
+          description: Why the current document set does not match the requested objective.
+          example: |
+            The current documents focus on reporting improvements instead of the requested approval workflow.
+      routes:
+        IMPLEMENTATION_READY:
+          description: The specification, plan, and tasks are aligned and ready for implementation.
+          next_stage: Implement
+        CHANGES_MADE:
+          description: This review run updated one or more delivery artifacts, so the revised documents must be reviewed again before implementation.
+          next_stage: Review Delivery Docs
+        NO_RELEVANT_ARTIFACTS:
+          description: The current artifacts are missing or do not meaningfully address the requested objective.
+          next_stage: Design Delivery
+          injections: [Objective Mismatch, Required Changes]
+    backup_artifacts:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+    read_only_paths:
+      - "src/**"
+      - "tests/**"
+    max_retries: 3
+    max_iterations: 3
+    max_iterations_next_stage: Implement
+
+  - name: Implement
+    prompt_template: |
+      Implement the approved feature end to end.
+
+      ## Context
+
+      - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` as the canonical delivery documents
+      - treat `.cybervisor/artifacts/tasks.md` as the active checklist for implementation progress
+
+      ## Requirements
+
+      - make production-ready code changes
+      - work through the todo items in `.cybervisor/artifacts/tasks.md` in order
+      - mark each todo item complete in `.cybervisor/artifacts/tasks.md` immediately after that item is actually finished
+      - do not mark a todo item complete before the corresponding implementation, testing, or verification work is done
+      - add or update automated tests
+      - preserve existing project conventions
+      - prepare the codebase for senior review without asking the user follow-up questions
+    keep_artifacts:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+    max_retries: 3
+    next_stage: Review Code
+
+  - name: Review Code
+    prompt_template: |
+      Perform a senior-engineer review of the latest implementation and refine it directly when needed.
+
+      ## Context
+
+      - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` to confirm what the implementation is supposed to deliver
+      - if any of `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, or `.cybervisor/artifacts/verify.md` is missing, use `IMPLEMENTATION_INCOMPLETE` status
+
+      ## Review Scope
+
+      - check the implementation against all generated docs so far and judge whether the code, tests, and behavior remain consistent with the spec, plan, and task breakdown
+      - inspect correctness, regressions, edge cases, and test quality
+      - call out any inconsistencies between the implementation and the generated docs, including scope drift, missing planned work, or behavior that no longer matches the documented workflow
+
+      ## Fixes
+
+      - if targeted fixes are needed, edit the code and tests directly before finishing this stage
+      - make the smallest correct set of changes and preserve working behavior outside the reported issues
+      - keep any fixes aligned with the approved scope and existing project conventions
+      - do not rewrite healthy code unnecessarily
+      - do not include large blocks of code in the review findings; use concise references to files, line numbers, and logic to save tokens
+      - keep the review actionable and specific
+
+      ## Routing
+
+      - if this stage edited any implementation or test file during the current run, do not use `APPROVED` status
+      - use `APPROVED` status only when the implementation is ready for documentation review and this stage made no code or test edits during the current run
+    contract:
+      fields:
+        Findings:
+          description: Specific correctness, regression, or completeness issues found in the implementation.
+          example: |
+            - The status history is not persisted after page refresh.
+            - The rejection path is not covered by tests.
+        Required Changes:
+          description: Concrete fixes required before the implementation can be approved.
+          example: |
+            - Persist review decisions in the backing store.
+            - Add regression coverage for reject and re-open flows.
+      routes:
+        APPROVED:
+          description: The implementation passed code review and is ready for documentation review.
+          next_stage: Review Docs
+        IMPLEMENTATION_INCOMPLETE:
+          description: The implementation is still materially unfinished and must return to implementation.
+          next_stage: Implement
+          injections: [Findings, Required Changes]
+        CHANGES_MADE:
+          description: This review run updated the implementation or tests, so the revised code must be reviewed again before documentation review.
+          next_stage: Review Code
+    keep_artifacts:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+    max_retries: 3
+    max_iterations: 10
+    max_iterations_next_stage: Review Docs
+
+  - name: Review Docs
+    prompt_template: |
+      Perform a senior documentation review of the implemented feature and its tracked docs.
+
+      ## Context
+
+      - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` to confirm the intended feature behavior, usage flow, and technical scope
+
+      ## Review Scope
+
+      - inspect the implementation together with `AGENTS.md` and `README.md` and the relevant files under the `docs/` directory
+      - treat `AGENTS.md` as the repository constitution for contributors and agents, and `README.md` and the `docs/` directory as user-facing documentation for end users and contributors who need to use the feature, not as deep internal engineering design documents
+      - confirm that user-facing behavior, usage instructions, setup steps, constraints, and the surface-level way the feature works are documented clearly enough for future users and contributors
+
+      ## Refinements
+
+      - focus on tracked documentation only; durable guidance must live in the `docs/` directory and, when relevant, `README.md`, and repository-level agent conventions must live in `AGENTS.md`
+      - if documentation refinements are needed, edit `AGENTS.md` and `README.md` and files under the `docs/` directory directly before finishing this stage
+      - do not rewrite healthy documentation unnecessarily; preserve stable content and make the smallest edits needed
+      - keep refinements focused on usage, setup, constraints, examples, troubleshooting, and concise surface-level behavior explanations
+      - do not dive deeply into implementation internals, architecture details, or low-level technical design unless a user needs that detail to use or operate the feature correctly
+      - do not require documentation for unrelated areas of the repository
+      - keep the review actionable and specific
+
+      ## Routing
+
+      - if this stage edited any tracked documentation file during the current run, do not use `APPROVED` status
+      - use `APPROVED` status only when the relevant docs are complete and aligned with the implementation and this stage made no documentation edits during the current run
+    contract:
+      fields:
+        Findings:
+          description: Specific documentation gaps or mismatches discovered during review.
+          example: |
+            - `README.md` explains setup but does not mention the new retry configuration flag.
+            - The docs describe the old review flow and omit the new verification behavior.
+        Required Changes:
+          description: Concrete documentation updates required before verification can begin.
+          example: |
+            - Add a README section describing how to enable and use the retry flag.
+            - Update the pipeline docs to reflect the new review and verification sequence.
+      routes:
+        APPROVED:
+          description: The relevant tracked docs are aligned with the implementation and ready for verification.
+          next_stage: Verify
+        CHANGES_MADE:
+          description: This review run updated tracked documentation, so the revised docs must be reviewed again before verification.
+          next_stage: Review Docs
+    keep_artifacts:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+    max_retries: 3
+    max_iterations: 5
+    max_iterations_next_stage: Verify
+
+  - name: Verify
+    prompt_template: |
+      Verify the latest reviewed implementation from a user perspective.
+
+      ## Context
+
+      - use `.cybervisor/artifacts/spec.md`, `.cybervisor/artifacts/plan.md`, `.cybervisor/artifacts/tasks.md`, and `.cybervisor/artifacts/verify.md` to confirm the intended workflow and acceptance expectations
+      - use `.cybervisor/artifacts/verify.md` as the step-by-step manual verification guide; follow each scenario and confirm the expected results match the actual behavior
+
+      ## Verification
+
+      - validate the primary user workflow end to end by actually running the CLI / engine from the terminal against a representative scenario (e.g., a small sample project or fixture), not just by reading the code
+      - inspect real outputs the user would see: command-line output, generated artifacts (chapters, manuscripts, logs, state/checkpoint files), exit codes, and progress / quality indicators
+      - exercise the pipeline behaviors that matter for this engine, including resume-from-checkpoint, failure recovery, and any quality-control gates declared in the spec
+      - use automated tests (unit / integration) as supporting evidence, not as the only verification method
+      - check for user-facing regressions and missing acceptance criteria from the end-user (engine operator) perspective
+      - do not silently patch implementation issues
+    contract:
+      fields:
+        Verification Results:
+          description: User-visible verification evidence and observed outcomes.
+          example: |
+            - Approve flow works from the review screen.
+            - Reject flow completes, but the detail page still shows the old status.
+        Required Changes:
+          description: Concrete fixes required before verification can pass.
+          example: |
+            - Refresh the detail view from the latest persisted status after rejection.
+            - Add end-to-end coverage for the reject flow.
+      routes:
+        APPROVED:
+          description: Verification passed and no further implementation work is required.
+        CHANGES_REQUESTED:
+          description: Verification found user-visible issues that must be fixed before the work can be accepted.
+          next_stage: Review Code
+          injections: [Verification Results, Required Changes]
+    keep_artifacts:
+      - .cybervisor/artifacts/spec.md
+      - .cybervisor/artifacts/plan.md
+      - .cybervisor/artifacts/tasks.md
+      - .cybervisor/artifacts/verify.md
+    max_retries: 3
+    reset_iterations:
+      - Review Code
+      - Review Docs
+
+disabled_skills:
+  # superpowers skill set
+  - brainstorming
+  - dispatching-parallel-agents
+  - executing-plans
+  - finishing-a-development-branch
+  - receiving-code-review
+  - requesting-code-review
+  - subagent-driven-development
+  - systematic-debugging
+  - test-driven-development
+  - using-git-worktrees
+  - using-superpowers
+  - verification-before-completion
+  - writing-plans
+  - writing-skills
+  # speckit skill set
+  - speckit-constitution
+  - speckit-specify
+  - speckit-plan
+  - speckit-tasks
+  - speckit-taskstoissues
+  - speckit-implement
+  - speckit-clarify
+  - speckit-analyze
+  - speckit-checklist
+  # openspec skill set
+  - openspec-propose
+  - openspec-explore
+  - openspec-apply-change
+  - openspec-archive-change
+  - openspec-new-change
+  - openspec-continue-change
+  - openspec-ff-change
+  - openspec-sync-specs
+  - openspec-bulk-archive-change
+  - openspec-verify-change
+  - openspec-onboard
