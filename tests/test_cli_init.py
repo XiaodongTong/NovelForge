@@ -1,4 +1,4 @@
-"""Tests for ``novelforge init`` scaffolding (PR-1).
+"""Tests for ``nf init`` scaffolding (PR-1).
 
 Covers spec §AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-12, AC-15
 (see ``.cybervisor/artifacts/spec.md``).  PR-2 concerns (split mode,

@@ -436,7 +436,7 @@ def test_batch_corrupt_length_detected(tmp_path: Path) -> None:
 
 def test_resume_resets_attempts_for_paused_stage(project_root: Path) -> None:
     """AC-10: after ``on_failure: pause`` triggers, the next
-    ``novelforge run`` must reset the paused stage's attempt counter
+    ``nf run`` must reset the paused stage's attempt counter
     to 0 so the user gets a fresh ``max_attempts`` budget.
 
     Without the reset, the counter would start at ``max_attempts``

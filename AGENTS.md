@@ -85,7 +85,7 @@ Three environment switches drive the negative scenarios in `tests/test_e2e_contr
 
 v4 separates **what a stage does** (declared in yaml) from **how the engine runs it** (`GenericStage`).  The right path depends on whether the new stage is project-specific or built-in:
 
-**Project-specific stage (most common):** edit the project's `novel-project.yaml` and append a new entry under `pipeline.stages` with the contract fields (`id / model / prompt / produces / done_when / consumes? / batch? / on_failure? / enabled?`).  No Python change is required — the engine will pick it up on the next `novelforge run` / `validate`.
+**Project-specific stage (most common):** edit the project's `novel-project.yaml` and append a new entry under `pipeline.stages` with the contract fields (`id / model / prompt / produces / done_when / consumes? / batch? / on_failure? / enabled?`).  No Python change is required — the engine will pick it up on the next `nf run` / `validate`.
 
 **New built-in template stage (scaffolds via `init`):**
 
@@ -99,7 +99,7 @@ Do **not** create new files under `src/novelforge/stages/` — that is the v3 pa
 
 - All tests must pass (`pytest -q`)
 - Coverage ≥ 80% on core modules
-- Config validation: `novelforge validate --config samples/minimal-novel/novel-project.yaml` must exit 0
+- Config validation: `nf validate --config samples/minimal-novel/novel-project.yaml` must exit 0
 - The `cybervisor.yaml` drives a 4-stage AI development pipeline (design → review → implement → verify) — this is separate from the novel pipeline
 
 ## Common Pitfalls

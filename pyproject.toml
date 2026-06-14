@@ -37,7 +37,7 @@ test = [
 ]
 
 [project.scripts]
-novelforge = "novelforge.cli:main"
+nf = "novelforge.cli:main"
 
 [project.urls]
 "Source" = "https://example.com/novelforge"

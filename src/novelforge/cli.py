@@ -2,11 +2,11 @@
 
 Implemented with Typer.  Five subcommands are registered:
 
-- ``novelforge run``     — start a fresh end-to-end pipeline run
-- ``novelforge resume``  — continue from the last valid checkpoint
-- ``novelforge status``  — print current state, progress, and token usage
-- ``novelforge validate``— validate a ``novel-project.yaml`` configuration
-- ``novelforge init``    — scaffold a fresh project from a built-in template
+- ``nf run``     — start a fresh end-to-end pipeline run
+- ``nf resume``  — continue from the last valid checkpoint
+- ``nf status``  — print current state, progress, and token usage
+- ``nf validate``— validate a ``novel-project.yaml`` configuration
+- ``nf init``    — scaffold a fresh project from a built-in template
 
 The CLI is intentionally thin: argument parsing and exit codes live here,
 business logic lives in the ``config``/``state``/``orchestrator`` modules.
@@ -247,7 +247,7 @@ def status(
     if not state_path.exists():
         console.print(
             f"[yellow]No state.yaml found.[/yellow] Run "
-            f"`novelforge run --config {path}` first."
+            f"`nf run --config {path}` first."
         )
         return
 
@@ -294,7 +294,7 @@ def _print_run_summary(summary: dict) -> None:
         reason = summary.get("paused_reason") or "unknown"
         console.print(
             f"[yellow]Pipeline paused[/yellow] reason={reason!r}. "
-            f"Fix the underlying issue then run `novelforge resume`."
+            f"Fix the underlying issue then run `nf resume`."
         )
     else:
         console.print(
@@ -581,14 +581,14 @@ def init(
         next_hint = (
             "no user seeds written (--skeleton-only).  "
             "Add outline/premise.md, outline/world.md, CLAUDE.md yourself "
-            "before running `novelforge run`."
+            "before running `nf run`."
         )
     else:
         next_hint = (
             "Next: edit `outline/premise.md` + `outline/world.md`, "
             "see `CLAUDE.md` for the writing rules.  "
-            "Then `novelforge validate --config novel-project.yaml` "
-            "and `novelforge run --use-mock`."
+            "Then `nf validate --config novel-project.yaml` "
+            "and `nf run --use-mock`."
         )
 
     console.print(

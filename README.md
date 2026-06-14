@@ -40,15 +40,15 @@ pip install -e ".[test]"
 ## CLI 命令
 
 ```bash
-novelforge --help               # 查看所有子命令
-novelforge --version            # 打印版本号
+nf --help               # 查看所有子命令
+nf --version            # 打印版本号
 
-novelforge validate --config <yaml>   # 校验配置文件
-novelforge run --config <yaml>        # 启动端到端流水线
-novelforge resume --config <yaml>     # 从 checkpoint 恢复
-novelforge status --config <yaml>     # 查看当前进度
-novelforge init --template long-epic --dir <path>   # 在空目录生成 v4 yaml + prompts/ + seeds + 运行时目录
-novelforge init --template long-epic --skeleton-only # 只生成 yaml + prompts/ + 运行时目录（跳过 seeds）
+nf validate --config <yaml>   # 校验配置文件
+nf run --config <yaml>        # 启动端到端流水线
+nf resume --config <yaml>     # 从 checkpoint 恢复
+nf status --config <yaml>     # 查看当前进度
+nf init --template long-epic --dir <path>   # 在空目录生成 v4 yaml + prompts/ + seeds + 运行时目录
+nf init --template long-epic --skeleton-only # 只生成 yaml + prompts/ + 运行时目录（跳过 seeds）
 ```
 
 ### 命令参数
@@ -70,7 +70,7 @@ novelforge init --template long-epic --skeleton-only # 只生成 yaml + prompts/
 
 ## 项目结构
 
-`novelforge init --template <name>` 跑完之后得到一个这样的目录（v4.1+）：
+`nf init --template <name>` 跑完之后得到一个这样的目录（v4.1+）：
 
 ```
 <project_dir>/
@@ -98,7 +98,7 @@ novelforge init --template long-epic --skeleton-only # 只生成 yaml + prompts/
 ```bash
 # 1. 在空目录里初始化项目骨架（v4.1+ 会一并生成 outline/ + CLAUDE.md 占位种子）
 mkdir my-novel && cd my-novel
-novelforge init --template long-epic --dir .
+nf init --template long-epic --dir .
 
 # 2. 填写种子文件（参考 init 时生成的 CLAUDE.md）
 $EDITOR outline/premise.md       # 核心冲突 / 主角北极星
@@ -106,18 +106,18 @@ $EDITOR outline/world.md         # 世界设定
 $EDITOR CLAUDE.md                # 写作约束（init 已写入模板，可按需调整）
 
 # 3. 校验配置
-novelforge validate --config novel-project.yaml
+nf validate --config novel-project.yaml
 # 预期输出: Config OK: N chapter(s)
 
 # 4. 运行流水线（mock 模式无需 API key，可先看连通性）
-novelforge run --config novel-project.yaml --use-mock
+nf run --config novel-project.yaml --use-mock
 # 预期: 依次执行 generate_outline → design_characters → write_chapter
 #        → review_chapter → final_polish
 #        在 characters/、chapters-outline/、output/ 下产出对应文件
 
 # 5. 查看进度 / 中断恢复
-novelforge status  --config novel-project.yaml
-novelforge resume  --config novel-project.yaml --use-mock
+nf status  --config novel-project.yaml
+nf resume  --config novel-project.yaml --use-mock
 ```
 
 ## 快速开始：跑通最小 sample
@@ -126,21 +126,21 @@ novelforge resume  --config novel-project.yaml --use-mock
 cd samples/minimal-novel
 
 # 1. 校验配置
-novelforge validate --config novel-project.yaml
+nf validate --config novel-project.yaml
 # 预期输出: Config OK: 1 chapter(s)
 
 # 2. 运行流水线（mock 模式，无需 API key）
-novelforge run --config novel-project.yaml --use-mock
+nf run --config novel-project.yaml --use-mock
 # 预期: 依次执行 generate_outline → design_characters → write_chapter
 #        → review_chapter
 #        在 chapters-outline/、characters/、output/ 下产出对应文件
 
 # 3. 查看进度
-novelforge status --config novel-project.yaml
+nf status --config novel-project.yaml
 # 预期: JSON 输出包含 current_stage, stage_attempts, token_usage
 
 # 4. 中断恢复
-novelforge resume --config novel-project.yaml --use-mock
+nf resume --config novel-project.yaml --use-mock
 # 预期: 从上次 checkpoint 继续
 ```
 
@@ -305,7 +305,7 @@ execution:
 |------|----------|------|
 | `claude: command not found` | Claude Code CLI 未安装 | 安装 CLI 或用 `--use-mock` 绕过 |
 | `ANTHROPIC_API_KEY is not set` | 未设置 API key 且未登录 CLI | 运行 `claude login` 或 `export ANTHROPIC_API_KEY=...` |
-| `Config validation failed` | yaml 不符合契约 schema | 检查 stage 字段，运行 `novelforge validate` |
+| `Config validation failed` | yaml 不符合契约 schema | 检查 stage 字段，运行 `nf validate` |
 | `state.yaml paused: true` | 多次重试耗尽 | 查看 `paused_reason` 与 `state.extra.stage_attempts`；修复后 `resume` |
 | `checkpoint corrupt: hash mismatch` | 进程被杀导致部分写入 | 删除损坏 checkpoint 或 `--force-stage` |
 | `context overflow` | 上下文超出预算 | 引擎按 consumes 顺序逆序裁剪并 warn |
